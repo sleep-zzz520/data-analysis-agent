@@ -1,0 +1,7 @@
+# 构建上下文排除项
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+.pytest_cache/

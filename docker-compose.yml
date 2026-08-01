@@ -1,0 +1,22 @@
+# 一键启动：docker compose up -d --build
+# 访问 http://localhost:8080 （前端经 nginx 代理 /api 到后端）
+services:
+  backend:
+    build: ./backend
+    container_name: da-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # 运行时数据（配置加密 JSON、SQLite、上传文件）持久化在宿主机
+      - ./backend/data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: da-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

@@ -69,6 +69,21 @@ DataAnalysis_Agent/
 | `llm_configs.json` / `db_configs.json` | 配置(Key 加密) |
 | `.master_key` | 加密密钥文件 |
 
+## 🐳 Docker 部署
+
+```bash
+# 构建并启动（前端 http://localhost:8080，后端 http://localhost:8000）
+docker compose up -d --build
+# 查看日志
+docker compose logs -f
+# 停止
+docker compose down
+```
+
+- 后端镜像：`python:3.9-slim`，非 root 运行，内置中文字体，`backend/data/` 以卷挂载持久化。
+- 前端镜像：多阶段构建（node 构建 → nginx 托管），nginx 代理 `/api` 到后端并关闭缓冲以支持 SSE 流式输出，内置 Vue Router history 路由 fallback。
+- 首次启动后在「配置中心」填写 LLM/DB 配置即可使用。
+
 ## 🚀 快速开始
 
 > **Clone 后注意**:`backend/data/`(运行时数据)不会随仓库分发——首次启动会自动创建 `data/` 目录,LLM/DB 配置请在页面「配置中心」里填写(密钥加密保存),无需任何环境变量。
