@@ -12,10 +12,10 @@
       </div>
       <div class="row">
         <ConfigList class="col-list" title="LLM 模型配置" :items="store.llmList" :current-id="store.currentLlmId"
-          :subtitle="(it) => `${it.model_name} · ${it.base_url}`"
+          :subtitle="(it) => `${it.model_name} · ${it.base_url}`" :readonly="!isAdmin"
           @create="llmEditing = null" @select="(it) => llmEditing = it"
           @set-default="setLlmDefault" @remove="removeLlm" @rename="renameLlm" />
-        <LlmConfigForm class="col-form" :initial-data="llmEditing" @submit="onLlmSubmit" />
+        <LlmConfigForm v-if="isAdmin" class="col-form" :initial-data="llmEditing" @submit="onLlmSubmit" />
       </div>
     </section>
 
@@ -26,10 +26,33 @@
       </div>
       <div class="row">
         <ConfigList class="col-list" title="数据库配置" :items="store.dbList" :current-id="store.currentDbId"
-          :subtitle="(it) => `${it.host}:${it.port}${it.default_schema ? ' · ' + it.default_schema : ' · 全部业务库'}`"
+          :subtitle="(it) => `${it.host}:${it.port}${it.default_schema ? ' · ' + it.default_schema : ' · 全部业务库'}`" :readonly="!isAdmin"
           @create="dbEditing = null" @select="(it) => dbEditing = it"
           @set-default="setDbDefault" @remove="removeDb" @rename="renameDb" />
-        <DbConfigForm class="col-form" :initial-data="dbEditing" @submit="onDbSubmit" />
+        <DbConfigForm v-if="isAdmin" class="col-form" :initial-data="dbEditing" @submit="onDbSubmit" />
+      </div>
+    </section>
+
+    <!-- 用户管理（仅管理员） -->
+    <section class="block" v-if="isAdmin">
+      <div class="section-title">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        用户管理
+      </div>
+      <div class="user-list">
+        <div v-for="u in users" :key="u.id" class="user-row">
+          <div class="user-info">
+            <span class="user-name">{{ u.username }}</span>
+            <span class="badge" :class="u.role">{{ u.role === 'admin' ? '管理员' : '普通用户' }}</span>
+            <span v-if="u.username === myName" class="user-self">（我）</span>
+          </div>
+          <div class="user-ops">
+            <button v-if="u.role === 'user'" class="mini-btn" @click="setRole(u, 'admin')">提升为管理员</button>
+            <button v-else-if="u.username !== myName" class="mini-btn" @click="setRole(u, 'user')">降级</button>
+            <span v-else class="user-self">不能修改自己的角色</span>
+          </div>
+        </div>
+        <div v-if="!users.length" class="user-empty">暂无用户</div>
       </div>
     </section>
   </div>
@@ -39,6 +62,7 @@
 import { ref, onMounted } from 'vue'
 import { useConfigStore } from '../stores/config.js'
 import * as api from '../api/config.js'
+import * as authApi from '../api/auth.js'
 import ConfigList from '../components/ConfigList.vue'
 import LlmConfigForm from '../components/LlmConfigForm.vue'
 import DbConfigForm from '../components/DbConfigForm.vue'
@@ -46,8 +70,26 @@ import DbConfigForm from '../components/DbConfigForm.vue'
 const store = useConfigStore()
 const llmEditing = ref(null)
 const dbEditing = ref(null)
+// 配置全局共享，仅管理员可修改
+const isAdmin = localStorage.getItem('role') === 'admin'
+const myName = localStorage.getItem('username') || ''
 
-onMounted(() => store.loadAll())
+// 用户管理（仅管理员）
+const users = ref([])
+
+onMounted(() => { store.loadAll(); loadUsers() })
+
+async function loadUsers() {
+  if (!isAdmin) return
+  try { users.value = await authApi.listUsers() } catch (_) { users.value = [] }
+}
+
+async function setRole(u, role) {
+  try {
+    await authApi.setUserRole(u.id, role)
+    u.role = role
+  } catch (err) { alert('操作失败：' + (err.suggestion || err.message)) }
+}
 
 // 保存后：用返回的 view 更新编辑态（新建→变成编辑态，避免重复新建），并刷新列表
 async function onLlmSubmit(form) {
@@ -133,4 +175,35 @@ async function renameDb(it, name)  { try { await api.saveDb({ ...it, name });  a
 
 .row { display: grid; grid-template-columns: 340px 1fr; gap: 16px; align-items: start; }
 @media (max-width: 820px) { .row { grid-template-columns: 1fr; } }
+
+/* ── 用户管理 ── */
+.user-list {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  padding: 8px;
+  box-shadow: var(--shadow-sm);
+}
+.user-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; border-radius: var(--radius-sm);
+}
+.user-row:hover { background: var(--bg-tertiary); }
+.user-info { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.user-name { font-weight: 600; font-size: 13px; color: var(--text-primary); }
+.user-self { font-size: 12px; color: var(--text-tertiary); }
+.user-list .badge {
+  font-size: 11px; padding: 2px 8px; border-radius: var(--radius-xl); font-weight: 500; flex: none;
+}
+.user-list .badge.admin { background: rgba(0, 0, 0, 0.08); color: var(--brand-start); }
+.user-list .badge.user { background: var(--bg-tertiary); color: var(--text-secondary); }
+.user-ops { display: flex; align-items: center; gap: 8px; flex: none; }
+.mini-btn {
+  background: none; border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm); padding: 5px 10px;
+  font-size: 12px; color: var(--text-secondary); cursor: pointer;
+  transition: var(--transition);
+}
+.mini-btn:hover { border-color: var(--brand-start); color: var(--brand-start); }
+.user-empty { color: var(--text-tertiary); font-size: 13px; padding: 12px; text-align: center; }
 </style>

@@ -73,7 +73,22 @@ def _conn() -> sqlite3.Connection:
             preview_rows TEXT,               -- JSON：前 5 行预览
             created_at   TEXT DEFAULT (datetime('now','localtime'))
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at    TEXT DEFAULT (datetime('now','localtime'))
+        );
     """)
+    # 迁移：旧库为 sessions/uploads 补充 user_id 列（多租户隔离）
+    for table in ("sessions", "uploads"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        if "user_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
+    # 迁移：users 表补充 role 列（admin / user）
+    ucols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    if "role" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
     conn.commit()
     return conn
 
@@ -134,7 +149,7 @@ def _deser(role: str, content: str, extra_str: Optional[str]):
 #  公开 API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def persist_messages(session_id: str, all_messages: list) -> None:
+def persist_messages(session_id: str, all_messages: list, user_id: Optional[int] = None) -> None:
     """将 all_messages 中尚未落盘的消息追加写入 SQLite（幂等）。
 
     用法：每轮对话结束后把内存 store 的完整历史传进来；
@@ -153,8 +168,8 @@ def persist_messages(session_id: str, all_messages: list) -> None:
             if row is None:
                 title = _auto_title(all_messages)
                 conn.execute(
-                    "INSERT INTO sessions(id, title) VALUES (?,?)",
-                    (session_id, title),
+                    "INSERT INTO sessions(id, title, user_id) VALUES (?,?,?)",
+                    (session_id, title, user_id),
                 )
 
             # 已落盘消息：优先按 msg_id 去重，旧数据（无 id）回退到内容指纹
@@ -222,23 +237,23 @@ def _fingerprint(role: str, content: str, extra: Optional[str]) -> str:
     return hashlib.md5(key.encode("utf-8", errors="replace")).hexdigest()
 
 
-def load_session(session_id: str) -> list:
+def load_session(session_id: str, user_id: Optional[int] = None) -> list:
     """从 SQLite 加载完整 LangChain Message 列表（用于恢复内存 store）。"""
     with _lock:
         conn = _conn()
         try:
             rows = conn.execute(
                 "SELECT role, content, extra FROM messages "
-                "WHERE session_id=? ORDER BY seq",
-                (session_id,),
+                "WHERE session_id=? AND user_id IS ? ORDER BY seq",
+                (session_id, user_id),
             ).fetchall()
             return [_deser(r["role"], r["content"], r["extra"]) for r in rows]
         finally:
             conn.close()
 
 
-def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
-    """返回最近会话列表（含标题、更新时间、消息条数）。"""
+def list_sessions(limit: int = 50, user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """返回当前用户的最近会话列表（含标题、更新时间、消息条数）。"""
     with _lock:
         conn = _conn()
         try:
@@ -247,38 +262,148 @@ def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
                 "       COUNT(m.id) AS msg_count "
                 "FROM sessions s "
                 "LEFT JOIN messages m ON m.session_id = s.id "
+                "WHERE s.user_id IS ? "
                 "GROUP BY s.id "
                 "ORDER BY s.updated_at DESC LIMIT ?",
-                (limit,),
+                (user_id, limit),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
 
 
-def delete_session(session_id: str) -> bool:
-    """删除会话及其所有消息，返回是否实际删除了记录。"""
+def delete_session(session_id: str, user_id: Optional[int] = None) -> bool:
+    """删除当前用户的会话及其所有消息，返回是否实际删除了记录。"""
     with _lock:
         conn = _conn()
         try:
-            cur = conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE id=? AND user_id IS ?",
+                (session_id, user_id),
+            )
             conn.commit()
             return cur.rowcount > 0
         finally:
             conn.close()
 
 
-def rename_session(session_id: str, title: str) -> bool:
-    """重命名会话标题，返回是否实际更新了记录。"""
+def rename_session(session_id: str, title: str, user_id: Optional[int] = None) -> bool:
+    """重命名当前用户的会话标题，返回是否实际更新了记录。"""
     with _lock:
         conn = _conn()
         try:
             cur = conn.execute(
-                "UPDATE sessions SET title=?, updated_at=? WHERE id=?",
-                (title, datetime.now().isoformat(timespec="seconds"), session_id),
+                "UPDATE sessions SET title=?, updated_at=? WHERE id=? AND user_id IS ?",
+                (title, datetime.now().isoformat(timespec="seconds"), session_id, user_id),
             )
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  用户账号（开放注册 + 多租户）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def create_user(username: str, password_hash: str) -> Optional[dict]:
+    """创建用户；第一个注册的账号为 admin，其余为 user。用户名重复返回 None。"""
+    with _lock:
+        conn = _conn()
+        try:
+            is_first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+            role = "admin" if is_first else "user"
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, role) VALUES (?,?,?)",
+                (username, password_hash, role),
+            )
+            conn.commit()
+            return {"id": cur.lastrowid, "role": role}
+        except sqlite3.IntegrityError:
+            return None
+        finally:
+            conn.close()
+
+
+def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id, username, password_hash, role, created_at FROM users WHERE username=?",
+                (username,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def claim_orphan_data(user_id: int) -> None:
+    """把旧版无主数据（user_id 为 NULL 的会话/上传）归给指定用户。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("UPDATE sessions SET user_id=? WHERE user_id IS NULL", (user_id,))
+            conn.execute("UPDATE uploads SET user_id=? WHERE user_id IS NULL", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_users() -> List[Dict[str, Any]]:
+    """用户列表（不含密码哈希）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, username, role, created_at FROM users ORDER BY id",
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def update_user_role(user_id: int, role: str) -> bool:
+    """设置用户角色（admin/user），返回是否更新了记录。"""
+    if role not in ("admin", "user"):
+        return False
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def update_password(user_id: int, password_hash: str) -> bool:
+    """更新用户密码哈希。"""
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def delete_user(user_id: int) -> list:
+    """注销账号：删除用户及其会话/上传记录，返回需删除的上传文件磁盘路径。"""
+    with _lock:
+        conn = _conn()
+        try:
+            paths = [r[0] for r in conn.execute(
+                "SELECT path FROM uploads WHERE user_id=?", (user_id,)
+            ).fetchall()]
+            conn.execute("DELETE FROM uploads WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))  # messages 级联删除
+            cur = conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            conn.commit()
+            return paths if cur.rowcount else []
         finally:
             conn.close()
 
@@ -287,31 +412,33 @@ def rename_session(session_id: str, title: str) -> bool:
 #  上传文件元信息（文件本体落盘在 data/uploads/，这里只存元信息）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def save_upload(file_id: str, name: str, path: str, columns: list, preview_rows: list) -> None:
+def save_upload(file_id: str, name: str, path: str, columns: list, preview_rows: list, user_id: Optional[int] = None) -> None:
     """记录一次上传的文件元信息。"""
     with _lock:
         conn = _conn()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO uploads(file_id, name, path, columns, preview_rows) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT OR REPLACE INTO uploads(file_id, name, path, columns, preview_rows, user_id) "
+                "VALUES (?,?,?,?,?,?)",
                 (file_id, name, path,
                  json.dumps(columns, ensure_ascii=False),
-                 json.dumps(preview_rows, ensure_ascii=False, default=str)),
+                 json.dumps(preview_rows, ensure_ascii=False, default=str),
+                 user_id),
             )
             conn.commit()
         finally:
             conn.close()
 
 
-def get_upload(file_id: str) -> Optional[Dict[str, Any]]:
-    """按 file_id 读取上传文件元信息；不存在返回 None。"""
+def get_upload(file_id: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """按 file_id 读取当前用户的上传文件元信息；不存在返回 None。"""
     with _lock:
         conn = _conn()
         try:
             row = conn.execute(
-                "SELECT file_id, name, path, columns, preview_rows FROM uploads WHERE file_id=?",
-                (file_id,),
+                "SELECT file_id, name, path, columns, preview_rows FROM uploads "
+                "WHERE file_id=? AND user_id IS ?",
+                (file_id, user_id),
             ).fetchone()
             if row is None:
                 return None
@@ -432,15 +559,22 @@ def get_display_messages(session_id: str) -> List[Dict[str, Any]]:
             conn.close()
 
 
-def get_session_info(session_id: str) -> Optional[Dict[str, Any]]:
-    """查询单个会话的元信息（标题、时间），不存在返回 None。"""
+def get_session_info(session_id: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """查询会话元信息。user_id 为 None 时做存在性检查；指定 user_id 时校验归属。"""
     with _lock:
         conn = _conn()
         try:
-            row = conn.execute(
-                "SELECT id, title, created_at, updated_at FROM sessions WHERE id=?",
-                (session_id,),
-            ).fetchone()
+            if user_id is None:
+                row = conn.execute(
+                    "SELECT id, title, created_at, updated_at FROM sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id, title, created_at, updated_at FROM sessions "
+                    "WHERE id=? AND user_id IS ?",
+                    (session_id, user_id),
+                ).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()

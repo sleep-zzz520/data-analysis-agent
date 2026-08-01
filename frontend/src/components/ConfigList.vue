@@ -2,7 +2,7 @@
   <div class="list">
     <div class="head">
       <span class="title">{{ title }}</span>
-      <button class="new" @click="$emit('create')">
+      <button v-if="!readonly" class="new" @click="$emit('create')">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         新建
       </button>
@@ -10,7 +10,7 @@
     <div v-if="!items.length" class="empty">暂无配置，点"新建"添加。</div>
     <ul v-else>
       <li v-for="it in items" :key="it.id" :class="{ active: it.id === currentId }">
-        <div class="info" @click="$emit('select', it)">
+        <div class="info" @click="!readonly && $emit('select', it)">
           <!-- 重命名编辑态 -->
           <input
             v-if="editingId === it.id"
@@ -29,7 +29,7 @@
           </template>
           <span class="sub">{{ subtitle(it) }}</span>
         </div>
-        <div class="ops">
+        <div class="ops" v-if="!readonly">
           <button class="op-btn" @click.stop="startRename(it)" title="重命名">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
           </button>
@@ -46,7 +46,7 @@
 </template>
 <script setup>
 import { ref, nextTick } from 'vue'
-defineProps({ items: Array, currentId: [Number, null], title: String, subtitle: { type: Function, default: () => '' } })
+defineProps({ items: Array, currentId: [Number, null], title: String, subtitle: { type: Function, default: () => '' }, readonly: Boolean })
 const emit = defineEmits(['select','setDefault','remove','create','rename'])
 const onRemove = (it) => { if (confirm(`确定删除配置「${it.name}」？`)) emit('remove', it) }
 

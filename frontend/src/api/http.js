@@ -1,8 +1,22 @@
 import axios from 'axios'
 const http = axios.create({ baseURL: '', timeout: 120000 })
+
+// 请求自动携带 token
+http.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token')
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
 http.interceptors.response.use(
   (res) => res.data,
   (err) => {
+    // 登录失效：清 token 跳登录页（登录页本身除外）
+    if (err.response?.status === 401 && !location.pathname.startsWith('/login')) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('username')
+      location.href = '/login'
+    }
     let e
     if (!err.response) {
       e = { code:'NETWORK', severity:'block', message:'无法连接到后端服务。', suggestion:'请确认后端已启动（uvicorn ... 8000），且 vite 代理目标正确。' }

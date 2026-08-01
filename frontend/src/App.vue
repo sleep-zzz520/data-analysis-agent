@@ -19,11 +19,98 @@
             配置中心
           </router-link>
         </nav>
+        <div class="topbar-user" v-if="username">
+          <span class="topbar-name">{{ username }}</span>
+          <span class="topbar-role" :class="role">{{ role === 'admin' ? '管理员' : '普通用户' }}</span>
+          <button class="topbar-logout" @click="showPwdModal = true">改密码</button>
+          <button class="topbar-logout del" @click="deleteAccount">注销</button>
+          <button class="topbar-logout" @click="logout">退出</button>
+        </div>
       </div>
     </header>
+
+    <!-- 修改密码弹窗 -->
+    <div v-if="showPwdModal" class="modal-mask" @click.self="showPwdModal = false">
+      <div class="modal">
+        <h3 class="modal-title">修改密码</h3>
+        <div class="modal-field">
+          <label>原密码</label>
+          <input v-model="oldPwd" type="password" placeholder="输入当前密码" />
+        </div>
+        <div class="modal-field">
+          <label>新密码</label>
+          <input v-model="newPwd" type="password" placeholder="至少 4 位" />
+        </div>
+        <p v-if="pwdMsg" class="modal-msg" :class="{ err: pwdErr }">{{ pwdMsg }}</p>
+        <div class="modal-actions">
+          <button class="modal-btn ghost" @click="showPwdModal = false">取消</button>
+          <button class="modal-btn primary" :disabled="pwdLoading" @click="doChangePwd">{{ pwdLoading ? '修改中...' : '确认修改' }}</button>
+        </div>
+      </div>
+    </div>
     <main class="page" :class="{ 'page-fluid': $route.name === 'chat' }"><router-view /></main>
   </div>
 </template>
+
+<script setup>
+import { ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import * as authApi from './api/auth.js'
+
+const router = useRouter()
+const username = ref(localStorage.getItem('username') || '')
+const role = ref(localStorage.getItem('role') || 'user')
+
+// 登录/退出都会跳转路由，此时用户名/角色可能已变化 → 同步一次
+watch(() => router.currentRoute.value.fullPath, () => {
+  username.value = localStorage.getItem('username') || ''
+  role.value = localStorage.getItem('role') || 'user'
+})
+
+// ── 修改密码 ──
+const showPwdModal = ref(false)
+const oldPwd = ref('')
+const newPwd = ref('')
+const pwdMsg = ref('')
+const pwdErr = ref(false)
+const pwdLoading = ref(false)
+
+async function doChangePwd() {
+  pwdMsg.value = ''
+  if (newPwd.value.length < 4) { pwdErr.value = true; pwdMsg.value = '新密码至少 4 位'; return }
+  pwdLoading.value = true
+  try {
+    await authApi.changePassword(oldPwd.value, newPwd.value)
+    pwdErr.value = false
+    pwdMsg.value = '✅ 修改成功，请重新登录'
+    setTimeout(() => { showPwdModal.value = false; logout() }, 1200)
+  } catch (err) {
+    pwdErr.value = true
+    pwdMsg.value = err.suggestion || err.message || '修改失败'
+  } finally {
+    pwdLoading.value = false
+  }
+}
+
+// ── 注销账号 ──
+async function deleteAccount() {
+  if (!confirm('确定注销当前账号？该账号的会话和上传文件将被永久删除，且不可恢复！')) return
+  try {
+    await authApi.deleteAccount()
+    alert('账号已注销')
+    logout()
+  } catch (err) {
+    alert('注销失败：' + (err.suggestion || err.message))
+  }
+}
+
+function logout() {
+  localStorage.removeItem('token')
+  localStorage.removeItem('username')
+  localStorage.removeItem('role')
+  router.push('/login')
+}
+</script>
 
 <style>
 /* ── Design System Tokens ── */
@@ -101,6 +188,69 @@ body {
   background: rgba(0, 0, 0, 0.06);
   font-weight: 600;
 }
+
+/* ── 顶栏用户区 ── */
+.topbar-user {
+  display: flex; align-items: center; gap: 10px;
+}
+.topbar-name {
+  font-size: 13px; font-weight: 500;
+  color: var(--text-secondary);
+  max-width: 140px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.topbar-role {
+  font-size: 11px; padding: 2px 8px; border-radius: var(--radius-xl);
+  font-weight: 600; flex: none;
+}
+.topbar-role.admin { background: var(--brand-gradient); color: #fff; }
+.topbar-role.user { background: var(--bg-tertiary); color: var(--text-secondary); border: 1px solid var(--border-color); }
+.topbar-logout {
+  background: none; border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
+  transition: var(--transition);
+}
+.topbar-logout:hover { color: #EF4444; border-color: rgba(239, 68, 68, 0.3); }
+.topbar-logout.del { color: #EF4444; border-color: rgba(239, 68, 68, 0.3); }
+.topbar-logout.del:hover { background: rgba(239, 68, 68, 0.06); }
+
+/* ── 修改密码弹窗 ── */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 999;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  width: 340px;
+  background: var(--bg-primary);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  box-shadow: var(--shadow-lg);
+}
+.modal-title { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
+.modal-field { margin-bottom: 12px; }
+.modal-field label { display: block; font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-bottom: 6px; }
+.modal-field input {
+  width: 100%; padding: 8px 12px;
+  border: 1px solid var(--border-color); border-radius: var(--radius-sm);
+  font-size: 14px; color: var(--text-primary);
+}
+.modal-field input:focus { outline: none; border-color: var(--brand-start); }
+.modal-msg { font-size: 13px; margin-bottom: 10px; color: #16A34A; }
+.modal-msg.err { color: #EF4444; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal-btn {
+  padding: 8px 16px; border-radius: var(--radius-sm);
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  transition: var(--transition);
+}
+.modal-btn.ghost { background: none; border: 1px solid var(--border-color); color: var(--text-secondary); }
+.modal-btn.ghost:hover { border-color: var(--border-color); background: var(--bg-tertiary); }
+.modal-btn.primary { background: var(--brand-gradient); border: none; color: #fff; }
+.modal-btn.primary:hover:not(:disabled) { opacity: 0.92; }
+.modal-btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Page Container ── */
 .page {

@@ -40,6 +40,7 @@ def _try_include(mod_path: str, desc: str):
 
 _try_include("app.api.chat_api", "/api/chat & /api/upload & /api/schema")
 _try_include("app.api.config_api", "/api/config")
+_try_include("app.api.auth_api", "/api/auth")
 
 
 # ── 启动自检 ──────────────────────────────────

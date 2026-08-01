@@ -4,7 +4,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, List
 import pandas as pd
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import (
@@ -31,6 +31,7 @@ from app.persistence import (
     save_upload,
     get_upload,
 )
+from app.api.auth_api import get_current_user
 
 router = APIRouter()
 
@@ -42,18 +43,18 @@ _file_df_cache_lock = threading.Lock()
 _FILE_DF_CACHE_MAX = 12
 
 
-def _load_uploaded_dfs(file_ids: List) -> dict:
-    """按 file_id 加载上传文件 DataFrame（磁盘 + LRU 缓存）。"""
+def _load_uploaded_dfs(file_ids: List, user_id: int) -> dict:
+    """按 file_id 加载当前用户的上传文件 DataFrame（磁盘 + LRU 缓存）。"""
     dfs: dict = {}
     for fid in file_ids:
         with _file_df_cache_lock:
             df = _file_df_cache.get(fid)
         if df is not None:
-            meta = get_upload(str(fid))
+            meta = get_upload(str(fid), user_id)
             if meta:
                 dfs[meta["name"]] = df
             continue
-        meta = get_upload(str(fid))
+        meta = get_upload(str(fid), user_id)
         if meta is None:
             continue
         try:
@@ -126,18 +127,27 @@ def _extract(messages):
     return visuals, tables, sql
 
 # ── 辅助：若内存 store 无该 session 但 SQLite 有，则从 SQLite 恢复 ──────────
-def _ensure_loaded(sid: str) -> None:
-    """保证内存 store 中有该 session 的历史（从 SQLite 懒加载）。"""
+def _ensure_loaded(sid: str, user_id: Optional[int]) -> None:
+    """保证内存 store 中有该 session 的历史（从 SQLite 懒加载，校验归属）。"""
     if get_history(sid):
         return
-    db_msgs = db_load_session(sid)
+    db_msgs = db_load_session(sid, user_id)
     if db_msgs:
         save_messages(sid, db_msgs)
 
 
+def _ensure_session_access(sid: Optional[str], uid: int) -> None:
+    """会话存在但非本人 → 403；不存在（新会话）→ 放行。"""
+    if not sid:
+        return
+    if get_session_info(sid) and not get_session_info(sid, uid):
+        raise HTTPException(403, "无权访问该会话")
+
+
 @router.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     sid = req.session_id or str(uuid.uuid4())
+    _ensure_session_access(req.session_id, user["uid"])
     lock = await _session_lock(sid)
     async with lock:  # 同一会话串行处理，避免并发交错
         try:
@@ -145,19 +155,19 @@ async def chat(req: ChatRequest):
             db_cfg = get_db_secret(req.db_config_id)
             engine = build_engine(db_cfg)
             # 上传文件 → DataFrame 字典（供 file_tool 真实查询，磁盘+LRU）
-            uploaded_files = _load_uploaded_dfs(req.file_ids)
+            uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files)
             graph = make_graph(llm, tools)
 
             ctx = ""
             for fid in req.file_ids:
-                meta = get_upload(str(fid))
+                meta = get_upload(str(fid), user["uid"])
                 if meta:
                     ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
             user_text = (ctx + "\n" + req.message) if ctx else req.message
 
             # ── 多轮对话：先从 SQLite 懒加载（服务重启后自动恢复）───────────────
-            _ensure_loaded(sid)
+            _ensure_loaded(sid, user["uid"])
             history = get_history(sid)
             input_messages = [
                 SystemMessage(content=SYSTEM_PROMPT + "\n\n" + CONVERSATION_HINT)
@@ -175,7 +185,7 @@ async def chat(req: ChatRequest):
             save_messages(sid, [user_msg] + new_msgs)
 
             # ── 持久化：把内存 store 的完整历史同步到 SQLite（幂等去重）────
-            persist_messages(sid, get_history(sid))
+            persist_messages(sid, get_history(sid), user["uid"])
 
             msgs = result_messages
             visuals, tables, sql = _extract(msgs)
@@ -200,7 +210,7 @@ def _sse(obj: dict) -> str:
 
 
 @router.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     """流式对话接口（SSE）。
 
     事件类型（JSON 的 type 字段）：
@@ -209,6 +219,7 @@ async def chat_stream(req: ChatRequest):
       - error: {"type":"error","error":{...},"session_id"}                 异常
     """
     sid = req.session_id or str(uuid.uuid4())
+    _ensure_session_access(req.session_id, user["uid"])
     lock = await _session_lock(sid)
 
     async def gen():
@@ -218,19 +229,18 @@ async def chat_stream(req: ChatRequest):
                 db_cfg = get_db_secret(req.db_config_id)
                 engine = build_engine(db_cfg)
                 # 上传文件 → DataFrame 字典（供 file_tool 真实查询）
-                uploaded_files = {}
-                uploaded_files = _load_uploaded_dfs(req.file_ids)
+                uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files)
                 graph = make_graph(llm, tools)
 
                 ctx = ""
                 for fid in req.file_ids:
-                    meta = get_upload(str(fid))
+                    meta = get_upload(str(fid), user["uid"])
                     if meta:
                         ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
                 user_text = (ctx + "\n" + req.message) if ctx else req.message
 
-                _ensure_loaded(sid)
+                _ensure_loaded(sid, user["uid"])
                 history = get_history(sid)
                 input_messages = [
                     SystemMessage(content=SYSTEM_PROMPT + "\n\n" + CONVERSATION_HINT)
@@ -260,7 +270,7 @@ async def chat_stream(req: ChatRequest):
                     if not getattr(m, "id", None):
                         m.id = str(uuid.uuid4())
                 save_messages(sid, [user_msg] + list(all_new))
-                persist_messages(sid, get_history(sid))
+                persist_messages(sid, get_history(sid), user["uid"])
 
                 # ── 提取图表/SQL，发送最终结果 ────────────────────────────
                 result_messages = list(input_messages) + list(all_new)
@@ -291,7 +301,7 @@ async def chat_stream(req: ChatRequest):
 
 
 @router.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     name = file.filename or "file"
     raw = await file.read()
     ext = name.rsplit(".", 1)[-1].lower()
@@ -312,12 +322,12 @@ async def upload(file: UploadFile = File(...)):
     cols = list(df.columns)
     d2 = df.head(5)
     preview = d2.where(d2.notna(), None).values.tolist()
-    save_upload(fid, name, str(file_path), cols, preview)
+    save_upload(fid, name, str(file_path), cols, preview, user["uid"])
     return {"file_id": fid, "columns": cols, "preview_rows": preview}
 
 
 @router.delete("/api/chat/{session_id}")
-def clear_chat(session_id: str):
+def clear_chat(session_id: str, user: dict = Depends(get_current_user)):
     """清除指定会话的对话历史（前端点击「新对话」时可调用）。"""
     clear_session(session_id)
     return {"ok": True}
@@ -328,15 +338,15 @@ def clear_chat(session_id: str):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.get("/api/sessions")
-def api_list_sessions(limit: int = 50):
-    """列出所有历史会话（含标题、最后更新时间、消息条数）。"""
-    return db_list_sessions(limit)
+def api_list_sessions(limit: int = 50, user: dict = Depends(get_current_user)):
+    """列出当前用户的历史会话（含标题、最后更新时间、消息条数）。"""
+    return db_list_sessions(limit, user["uid"])
 
 
 @router.get("/api/sessions/{session_id}")
-def api_get_session(session_id: str):
-    """获取指定会话的元信息 + 显示用消息列表。"""
-    info = get_session_info(session_id)
+def api_get_session(session_id: str, user: dict = Depends(get_current_user)):
+    """获取当前用户指定会话的元信息 + 显示用消息列表。"""
+    info = get_session_info(session_id, user["uid"])
     if info is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     info["messages"] = get_display_messages(session_id)
@@ -344,12 +354,12 @@ def api_get_session(session_id: str):
 
 
 @router.delete("/api/sessions/{session_id}")
-def api_delete_session(session_id: str):
-    """从 SQLite 永久删除指定会话及其所有消息。"""
+def api_delete_session(session_id: str, user: dict = Depends(get_current_user)):
+    """从 SQLite 永久删除当前用户的指定会话及其所有消息。"""
     # 同时清除内存 store（若还在）
     clear_session(session_id)
     _release_session_lock(session_id)
-    deleted = db_delete_session(session_id)
+    deleted = db_delete_session(session_id, user["uid"])
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"ok": True}
@@ -360,14 +370,14 @@ class RenameRequest(BaseModel):
 
 
 @router.put("/api/sessions/{session_id}")
-def api_rename_session(session_id: str, req: RenameRequest):
-    """重命名会话标题。"""
+def api_rename_session(session_id: str, req: RenameRequest, user: dict = Depends(get_current_user)):
+    """重命名当前用户的会话标题。"""
     title = (req.title or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="标题不能为空")
     if len(title) > 60:
         raise HTTPException(status_code=400, detail="标题过长（最多 60 字）")
-    if not db_rename_session(session_id, title):
+    if not db_rename_session(session_id, title, user["uid"]):
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"ok": True, "session_id": session_id, "title": title}
 
