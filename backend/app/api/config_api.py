@@ -1,0 +1,134 @@
+# app/api/config_api.py —— 对接加密版 store
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from app.meta import store
+from app.meta import crypto
+
+router = APIRouter(prefix="/api/config", tags=["config"])
+
+# ---------- Request Models ----------
+class LLMConfigSave(BaseModel):
+    id: Optional[int] = None
+    name: str
+    provider: str = "openai"              # openai / anthropic / qwen
+    base_url: str = ""
+    model_name: str
+    api_key: Optional[str] = None       # 编辑时若为空/掩码串则保留原密文
+    temperature: float = 0
+    max_tokens: Optional[int] = None
+    is_default: bool = False
+
+class DBConfigSave(BaseModel):
+    id: Optional[int] = None
+    name: str
+    db_type: str
+    host: str
+    port: int
+    username: str
+    password: Optional[str] = None      # 同上
+    charset: str = "utf8mb4"
+    default_schema: Optional[str] = None
+    is_default: bool = False
+
+# ---------- LLM ----------
+@router.get("/llm")
+def list_llm():
+    return store.list_llm_configs()
+
+@router.get("/llm/{cfg_id}")
+def get_llm(cfg_id: int):
+    cfg = store.get_llm_config(cfg_id)
+    if not cfg: raise HTTPException(404, "LLM config not found")
+    return cfg
+
+@router.post("/llm")
+def save_llm(req: LLMConfigSave):
+    payload = req.model_dump()
+    # 编辑时若 api_key 是掩码串或空，保留原密文
+    if payload.get("id") is not None:
+        existing = store.get_llm_config(payload["id"])
+        if existing and (not payload.get("api_key") or payload["api_key"].startswith(existing.get("api_key_masked", "")[:4])):
+            # 用户未改 key，从原记录取回密文
+            secret = store.get_llm_secret(payload["id"])
+            if secret and "api_key" in secret:
+                payload["api_key"] = secret["api_key"]
+            else:
+                payload.pop("api_key", None)
+    return store.save_llm_config(payload)
+
+@router.delete("/llm/{cfg_id}")
+def delete_llm(cfg_id: int):
+    if not store.delete_llm_config(cfg_id):
+        raise HTTPException(404, "LLM config not found")
+    return {"ok": True}
+
+# ---------- DB ----------
+@router.get("/db")
+def list_db():
+    return store.list_db_configs()
+
+@router.get("/db/{cfg_id}")
+def get_db(cfg_id: int):
+    cfg = store.get_db_config(cfg_id)
+    if not cfg: raise HTTPException(404, "DB config not found")
+    return cfg
+
+@router.post("/db")
+def save_db(req: DBConfigSave):
+    payload = req.model_dump()
+    if payload.get("id") is not None:
+        existing = store.get_db_config(payload["id"])
+        if existing and (not payload.get("password") or payload["password"].startswith(existing.get("password_masked", "")[:4])):
+            secret = store.get_db_secret(payload["id"])
+            if secret and "password" in secret:
+                payload["password"] = secret["password"]
+            else:
+                payload.pop("password", None)
+    return store.save_db_config(payload)
+
+@router.delete("/db/{cfg_id}")
+def delete_db(cfg_id: int):
+    if not store.delete_db_config(cfg_id):
+        raise HTTPException(404, "DB config not found")
+    return {"ok": True}
+
+# ---------- Test Connection ----------
+@router.post("/llm/test")
+def test_llm(req: LLMConfigSave):
+    """测试连接用真实 key（按 provider 分发）"""
+    from app.core.factories import build_llm_from
+    api_key = req.api_key
+    # 若是编辑且传了掩码串，取真 key
+    if req.id and api_key and "****" in api_key:
+        secret = store.get_llm_secret(req.id)
+        api_key = secret["api_key"] if secret else api_key
+    try:
+        llm = build_llm_from(
+            provider=req.provider,
+            model_name=req.model_name,
+            api_key=api_key,
+            base_url=req.base_url,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+        )
+        llm.invoke("hi")
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@router.post("/db/test")
+def test_db(req: DBConfigSave):
+    """测试连接用真实 password"""
+    from sqlalchemy import create_engine, text
+    password = req.password
+    if req.id and password and "****" in password:
+        secret = store.get_db_secret(req.id)
+        password = secret["password"] if secret else password
+    uri = f"{req.db_type}+pymysql://{req.username}:{password}@{req.host}:{req.port}/?charset={req.charset}"
+    try:
+        engine = create_engine(uri, pool_pre_ping=True)
+        with engine.connect() as conn: conn.execute(text("SELECT 1"))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))

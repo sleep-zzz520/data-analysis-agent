@@ -1,0 +1,459 @@
+"""对话记录 SQLite 持久化模块。
+
+职责：
+  - 镜像内存 ConversationStore 的消息到 SQLite（重启不丢）
+  - 提供会话列表 / 会话详情 / 删除接口
+  - 不做任何摘要、检索、压缩
+
+用法（在现有 chat 流程中两行即可接入）：
+    from app.persistence import persist_messages, load_session, list_sessions
+
+    # 每轮对话结束后追加保存（幂等，只写新增消息）
+    persist_messages(session_id, full_history)
+
+    # 恢复会话时加载完整 LangChain 消息
+    messages = load_session(session_id)
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    SystemMessage,
+)
+
+# ── 数据库路径（与 data/llm_configs.json 同级）────────────────────────────────
+# 用 __file__ 推导绝对路径，避免从不同工作目录启动时数据分裂
+_BASE_DIR = Path(__file__).resolve().parents[2]  # backend/
+_DB_DIR = _BASE_DIR / "data"
+_DB_PATH = _DB_DIR / "chat_history.db"
+_lock = threading.Lock()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  内部：连接 & 建表
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _conn() -> sqlite3.Connection:
+    _DB_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id         TEXT PRIMARY KEY,
+            title      TEXT    DEFAULT '新对话',
+            created_at TEXT    DEFAULT (datetime('now','localtime')),
+            updated_at TEXT    DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            seq        INTEGER NOT NULL,   -- 消息序号（从 0 开始）
+            role       TEXT    NOT NULL,
+            content    TEXT,
+            extra      TEXT,               -- JSON：tool_calls / tool_call_id / name 等
+            UNIQUE(session_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id, seq);
+        CREATE TABLE IF NOT EXISTS uploads (
+            file_id      TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            path         TEXT NOT NULL,
+            columns      TEXT,               -- JSON：列名列表
+            preview_rows TEXT,               -- JSON：前 5 行预览
+            created_at   TEXT DEFAULT (datetime('now','localtime'))
+        );
+    """)
+    conn.commit()
+    return conn
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  序列化 / 反序列化  LangChain Message ↔ (role, content, extra)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _ser(msg) -> tuple[str, str, Optional[str]]:
+    """LangChain Message → (role, content, extra_json?)"""
+    extra: dict = {}
+    # 稳定 ID：持久化去重的可靠依据（内容可能相同，如两轮 tool 都返回 'ok'）
+    mid = getattr(msg, "id", None)
+    if mid:
+        extra["msg_id"] = mid
+    if isinstance(msg, HumanMessage):
+        role = "user"
+    elif isinstance(msg, AIMessage):
+        role = "assistant"
+        tc = getattr(msg, "tool_calls", None)
+        if tc:
+            extra["tool_calls"] = tc
+    elif isinstance(msg, ToolMessage):
+        role = "tool"
+        if getattr(msg, "tool_call_id", None):
+            extra["tool_call_id"] = msg.tool_call_id
+        if getattr(msg, "name", None):
+            extra["name"] = msg.name
+    elif isinstance(msg, SystemMessage):
+        role = "system"
+    else:
+        role = "unknown"
+    return role, (msg.content or ""), (json.dumps(extra, ensure_ascii=False) if extra else None)
+
+
+def _deser(role: str, content: str, extra_str: Optional[str]):
+    """(role, content, extra_json?) → LangChain Message 实例"""
+    extra: dict = json.loads(extra_str) if extra_str else {}
+    mid = extra.get("msg_id")
+    if role == "user":
+        return HumanMessage(content=content, id=mid)
+    if role == "assistant":
+        tc = extra.get("tool_calls") or []
+        return AIMessage(content=content, tool_calls=tc, id=mid)
+    if role == "tool":
+        return ToolMessage(
+            content=content,
+            tool_call_id=extra.get("tool_call_id", ""),
+            name=extra.get("name"),
+            id=mid,
+        )
+    if role == "system":
+        return SystemMessage(content=content, id=mid)
+    return HumanMessage(content=f"[{role}] {content}", id=mid)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  公开 API
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def persist_messages(session_id: str, all_messages: list) -> None:
+    """将 all_messages 中尚未落盘的消息追加写入 SQLite（幂等）。
+
+    用法：每轮对话结束后把内存 store 的完整历史传进来；
+    函数按消息内容指纹去重，只 INSERT 新增部分，并保证 seq 单调递增。
+
+    相比按 COUNT(*) 切片定位增量，本实现不受内存历史被裁剪
+    （MAX_TURNS 截断）或并发写入的影响，不会丢消息、也不会 seq 冲突。
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            # 确保 session 记录存在
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                title = _auto_title(all_messages)
+                conn.execute(
+                    "INSERT INTO sessions(id, title) VALUES (?,?)",
+                    (session_id, title),
+                )
+
+            # 已落盘消息：优先按 msg_id 去重，旧数据（无 id）回退到内容指纹
+            exist_rows = conn.execute(
+                "SELECT role, content, extra FROM messages WHERE session_id=?",
+                (session_id,),
+            ).fetchall()
+            exist_ids: set = set()
+            exist_fps: set = set()
+            for r in exist_rows:
+                ex = json.loads(r["extra"]) if r["extra"] else {}
+                mid = ex.get("msg_id")
+                if mid:
+                    exist_ids.add(mid)
+                else:
+                    exist_fps.add(_fingerprint(r["role"], r["content"], r["extra"]))
+            max_seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) FROM messages WHERE session_id=?",
+                (session_id,),
+            ).fetchone()[0]
+
+            # 找出真正新增的消息（保持原有顺序）
+            new_msgs: list = []
+            for m in all_messages:
+                role, content, extra_str = _ser(m)
+                ex = json.loads(extra_str) if extra_str else {}
+                mid = ex.get("msg_id")
+                if mid:
+                    if mid in exist_ids:
+                        continue
+                    exist_ids.add(mid)
+                else:
+                    fp = _fingerprint(role, content, extra_str)
+                    if fp in exist_fps:
+                        continue
+                    exist_fps.add(fp)
+                new_msgs.append(m)
+            next_seq = max_seq + 1
+            for i, msg in enumerate(new_msgs):
+                role, content, extra = _ser(msg)
+                conn.execute(
+                    "INSERT INTO messages(session_id, seq, role, content, extra) "
+                    "VALUES (?,?,?,?,?)",
+                    (session_id, next_seq + i, role, content, extra),
+                )
+
+            # 更新 title（首次保存时）和时间戳
+            updates: dict = {"updated_at": datetime.now().isoformat(timespec="seconds")}
+            if row is None:
+                updates["title"] = _auto_title(all_messages)
+            sets = ", ".join(f"{k}=?" for k in updates)
+            conn.execute(
+                f"UPDATE sessions SET {sets} WHERE id=?",
+                list(updates.values()) + [session_id],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _fingerprint(role: str, content: str, extra: Optional[str]) -> str:
+    """消息内容指纹：role + content + extra 的稳定摘要（用于幂等去重）。"""
+    import hashlib
+    key = f"{role}\x00{content or ''}\x00{extra or ''}"
+    return hashlib.md5(key.encode("utf-8", errors="replace")).hexdigest()
+
+
+def load_session(session_id: str) -> list:
+    """从 SQLite 加载完整 LangChain Message 列表（用于恢复内存 store）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT role, content, extra FROM messages "
+                "WHERE session_id=? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+            return [_deser(r["role"], r["content"], r["extra"]) for r in rows]
+        finally:
+            conn.close()
+
+
+def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
+    """返回最近会话列表（含标题、更新时间、消息条数）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT s.id, s.title, s.created_at, s.updated_at, "
+                "       COUNT(m.id) AS msg_count "
+                "FROM sessions s "
+                "LEFT JOIN messages m ON m.session_id = s.id "
+                "GROUP BY s.id "
+                "ORDER BY s.updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def delete_session(session_id: str) -> bool:
+    """删除会话及其所有消息，返回是否实际删除了记录。"""
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def rename_session(session_id: str, title: str) -> bool:
+    """重命名会话标题，返回是否实际更新了记录。"""
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE sessions SET title=?, updated_at=? WHERE id=?",
+                (title, datetime.now().isoformat(timespec="seconds"), session_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  上传文件元信息（文件本体落盘在 data/uploads/，这里只存元信息）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def save_upload(file_id: str, name: str, path: str, columns: list, preview_rows: list) -> None:
+    """记录一次上传的文件元信息。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO uploads(file_id, name, path, columns, preview_rows) "
+                "VALUES (?,?,?,?,?)",
+                (file_id, name, path,
+                 json.dumps(columns, ensure_ascii=False),
+                 json.dumps(preview_rows, ensure_ascii=False, default=str)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_upload(file_id: str) -> Optional[Dict[str, Any]]:
+    """按 file_id 读取上传文件元信息；不存在返回 None。"""
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT file_id, name, path, columns, preview_rows FROM uploads WHERE file_id=?",
+                (file_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["columns"] = json.loads(d["columns"]) if d["columns"] else []
+            d["preview_rows"] = json.loads(d["preview_rows"]) if d["preview_rows"] else []
+            return d
+        finally:
+            conn.close()
+
+
+def get_display_messages(session_id: str) -> List[Dict[str, Any]]:
+    """返回前端可直接渲染的消息列表（已过滤 system/tool 中间消息）。
+
+    按"轮次"聚合：一轮 = user 消息 + 该轮最终 assistant 回复。
+    中间过程消息（assistant 的 tool_calls、tool 结果）被隐藏，
+    其 sql / chart / table 合并到该轮最终回复上，保证顺序与实时对话一致
+    （不会出现"图在上、话在下"）。
+
+    返回格式：
+    [
+      {"role": "user",      "text": "...", "sql": null},
+      {"role": "assistant", "text": "...", "sql": "SELECT ...", "chart": {...}, "table": {...}},
+      ...
+    ]
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT role, content, extra FROM messages "
+                "WHERE session_id=? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+
+            import re
+            _CHART_RE = re.compile(r"<!--CHART:(.*?)-->", re.S)
+            _TABLE_RE = re.compile(r"<!--TABLE:(.*?)-->", re.S)
+            _IMAGE_RE = re.compile(r"<!--IMAGE_BASE64:(.*?)-->", re.S)
+
+            # ── 第一遍：按轮次聚合 ────────────────────────────────────────
+            turns: List[Dict[str, Any]] = []
+            cur: Optional[Dict[str, Any]] = None
+            for r in rows:
+                role, content, extra_str = r["role"], r["content"], r["extra"]
+                extra: dict = json.loads(extra_str) if extra_str else {}
+
+                if role == "user":
+                    cur = {
+                        "user_text": content,
+                        "assistant": None,   # 该轮最终回复（若有）
+                        "sql": None,         # 该轮最后一次查询 SQL
+                        "visuals": [],       # [{chart, image}] 该轮所有图表
+                        "tables": [],        # 该轮所有表格
+                    }
+                    turns.append(cur)
+
+                elif role == "assistant":
+                    if cur is None:  # 极端情况：以 assistant 开头
+                        cur = {"user_text": "", "assistant": None,
+                               "sql": None, "visuals": [], "tables": []}
+                        turns.append(cur)
+                    # 始终保留该轮"最后一条" assistant（即最终回复）
+                    entry: Dict[str, Any] = {"text": content or "", "sql": None}
+                    for tc in extra.get("tool_calls", []):
+                        if tc.get("name") in ("query_mysql", "run_sql") and tc.get("args"):
+                            entry["sql"] = tc["args"].get("sql")
+                    cur["assistant"] = entry
+                    # 新一轮 tool 结果开始前，重置该轮附属数据
+                    cur["sql"] = None
+
+                elif role == "tool" and content:
+                    if cur is None:
+                        continue
+                    item: dict = {}
+                    mc = _CHART_RE.search(content)
+                    if mc:
+                        try:
+                            item["chart"] = json.loads(mc.group(1))
+                        except Exception:
+                            pass
+                    mi = _IMAGE_RE.search(content)
+                    if mi:
+                        item["image"] = mi.group(1)
+                    if item:
+                        cur["visuals"].append(item)
+                    for mt in _TABLE_RE.finditer(content):
+                        try:
+                            cur["tables"].append(json.loads(mt.group(1)))
+                        except Exception:
+                            pass
+
+            # ── 第二遍：组装输出 ──────────────────────────────────────────
+            result: List[Dict[str, Any]] = []
+            for t in turns:
+                if t["user_text"]:
+                    result.append({"role": "user", "text": t["user_text"]})
+                a = t["assistant"]
+                if a is None:
+                    # 该轮只有 tool 结果没有最终回复（异常中断）：合并成一条空消息兜底
+                    if t["visuals"] or t["tables"]:
+                        a = {"text": "", "sql": None}
+                    else:
+                        continue
+                entry: Dict[str, Any] = {
+                    "role": "assistant",
+                    "text": a["text"],
+                    "sql": a["sql"] or t["sql"],
+                }
+                if t["visuals"]:
+                    entry["visuals"] = t["visuals"]
+                if t["tables"]:
+                    entry["tables"] = t["tables"]
+                result.append(entry)
+
+            return result
+        finally:
+            conn.close()
+
+
+def get_session_info(session_id: str) -> Optional[Dict[str, Any]]:
+    """查询单个会话的元信息（标题、时间），不存在返回 None。"""
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT id, title, created_at, updated_at FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  工具函数
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _auto_title(messages: list) -> str:
+    """用第一条用户消息的前 30 字作为会话标题。"""
+    for m in messages:
+        if isinstance(m, HumanMessage) and m.content:
+            txt = m.content.strip().replace("\n", " ")
+            return txt[:30] + ("..." if len(txt) > 30 else "")
+    return "新对话"

@@ -1,0 +1,29 @@
+# 基础依赖
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+langchain>=0.0.300
+langchain-openai>=0.0.5
+langchain-anthropic>=0.3.0
+langgraph>=0.0.20
+pydantic>=2.0.0
+duckdb>=1.0.0  # 上传文件 SQL 查询
+
+# 数据可视化
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.17.0
+kaleido>=0.2.1  # plotly静态图渲染
+
+# 文件处理
+openpyxl>=3.1.0  # Excel文件支持
+python-multipart>=0.0.6  # 文件上传
+
+# 加密与安全
+cryptography>=41.0.0
+
+# 其他
+python-dotenv>=1.0.0

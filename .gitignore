@@ -1,0 +1,36 @@
+# ── 敏感信息（绝不提交）──────────────────────────────
+# backend/.env 含 API Key / 数据库密码
+backend/.env
+
+# backend/data/ 含加密配置、密钥、SQLite、上传文件
+backend/data/
+
+# 密钥文件
+*.master_key
+
+# ── Python ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ── Node ────────────────────────────────────────────
+node_modules/
+dist/
+*.local
+
+# ── IDE / 系统 ──────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+
+# ── 工具 / 日志 ─────────────────────────────────────
+.reasonix/
+reasonix.toml
+*.log
+
+# ── 测试临时文件 ────────────────────────────────────
+coverage/
+.pytest_cache/
