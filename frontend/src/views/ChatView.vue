@@ -121,7 +121,8 @@
           <p v-else class="empty-text">还没有可用配置,<router-link to="/config">去配置页</router-link> 添加 LLM 与数据库。</p>
         </div>
             
-        <div v-for="(m, i) in messages" :key="i" class="msg-wrapper" :class="m.role">
+        <div v-for="(m, i) in messages" :key="i" class="msg-wrapper" :class="m.role"
+             v-show="!(m.role === 'assistant' && !m.text && !m.error && !(m.visuals || []).length && !(m.tables || []).length)">
           <div class="msg">
             <!-- AI头像 - 左侧32px圆形 -->
             <div v-if="m.role === 'assistant'" class="avatar avatar-assistant">
@@ -173,8 +174,8 @@
           </div>
         </div>
             
-        <!-- 加载态:呼吸灯效果(仅当流式输出尚未开始) -->
-        <div v-if="loading && !streamingActive" class="msg-wrapper assistant">
+        <!-- 加载态:呼吸灯效果(仅当流式输出尚未开始 且 当前仍在本会话) -->
+        <div v-if="loading && !streamingActive && sendingSessionId === store.sessionId" class="msg-wrapper assistant">
           <div class="msg">
             <div class="avatar avatar-assistant">
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
@@ -246,6 +247,11 @@ const inputFocused = ref(false)
 const textareaRef = ref(null)
 // 流式输出是否已开始（开始后隐藏打字指示器，避免与流式文本重叠）
 const streamingActive = ref(false)
+const sendingSessionId = ref(null)  // 发送中的会话：切换会话后隐藏加载动画
+// 发送中未落库的本地消息（sessionId -> 消息数组）：切走再切回不丢用户气泡
+const pendingMsgs = ref(new Map())
+let msgSeq = 0
+const mkMsg = (role, text = '') => ({ role, text, timestamp: new Date().toISOString(), _key: `m${++msgSeq}` })
 
 // 会话加载竞态保护：快速切换会话时，只应用最后一次请求的结果，
 // 避免慢响应覆盖新会话的消息（串话）。
@@ -306,6 +312,9 @@ async function loadSession(sid, silent = false) {
         .map(v => ({ chart: parseChartConfig(v.chart), image: v.image || null })),
       timestamp: m.timestamp || new Date().toISOString()
     }))
+    // 合并发送中未落库的本地消息（用户气泡不因切会话丢失）
+    const pending = pendingMsgs.value.get(sid) || []
+    if (pending.length) messages.value = messages.value.concat(pending)
     scroll()
   } catch (err) {
     if (mySeq !== loadSeq) return
@@ -373,15 +382,27 @@ async function send() {
   if (!text || loading.value) return
   if (!store.ready) { router.push('/config'); return }
   const sidAtSend = store.sessionId  // 记录发送时的会话，防止响应回来时已切换会话
-  const timestamp = new Date().toISOString()
-  messages.value.push({ role: 'user', text, timestamp })
+  // Bug2 修复：发消息立即乐观更新会话列表（时间=现在并置顶），
+  // 回复完成后 refreshSessions 会用后端真实 updated_at 校准
+  const nowLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 19)
+  const curSession = sessions.value.find((x) => x.id === store.sessionId)
+  if (curSession) {
+    curSession.updated_at = nowLocal
+    sessions.value.sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+  }
   input.value = ''; loading.value = true; scroll()
+  sendingSessionId.value = store.sessionId
   // 重置textarea高度
   if (textareaRef.value) {
     textareaRef.value.style.height = 'auto'
   }
-  // 预创建 assistant 消息（空文本），流式增量填充
-  const idx = messages.value.push({ role: 'assistant', text: '', timestamp: new Date().toISOString() }) - 1
+  // 用户消息 + 预创建 assistant 占位（带 _key 身份），并缓存到本地（切会话不丢）
+  const userMsg = mkMsg('user', text)
+  const assistantMsg = mkMsg('assistant', '')
+  messages.value.push(userMsg, assistantMsg)
+  const pending = pendingMsgs.value.get(store.sessionId) || []
+  pending.push(userMsg, assistantMsg)
+  pendingMsgs.value.set(store.sessionId, pending)
   streamingActive.value = false
   try {
     await chatApi.streamChat(
@@ -395,13 +416,16 @@ async function send() {
       {
         onDelta: (t) => {
           if (store.sessionId !== sidAtSend) return
+          const target = messages.value.find(m => m._key === assistantMsg._key)
+          if (!target) return
           streamingActive.value = true
-          messages.value[idx].text += t
+          target.text += t
         },
         onDone: (res) => {
           if (store.sessionId !== sidAtSend) return  // 发送期间切换了会话：不显示，消息已落库
           if (res.session_id) store.setSession(res.session_id)
-          const msg = messages.value[idx]
+          const msg = messages.value.find(m => m._key === assistantMsg._key)
+          if (!msg) return
           msg.sql = res.sql || null
           // 一轮可能有多张图表/表格（visuals/tables 数组），兼容旧字段
           msg.tables = res.tables || (res.table ? [res.table] : [])
@@ -414,15 +438,23 @@ async function send() {
           if (!msg.text.trim()) msg.text = res.reply || '(无文本回复)'
         },
         onError: (err) => {
-          if (store.sessionId === sidAtSend) messages.value[idx].error = err
+          if (store.sessionId === sidAtSend) {
+            const target = messages.value.find(m => m._key === assistantMsg._key)
+            if (target) target.error = err
+          }
         }
       }
     )
+    // 发送成功：后端已落库，清掉本地缓存（避免切回后重复）
+    pendingMsgs.value.delete(sidAtSend)
     // 发送成功后刷新会话列表(标题/时间可能更新)
     await refreshSessions()
   } catch (err) {
-    if (store.sessionId === sidAtSend) messages.value[idx].error = err
-  } finally { loading.value = false; streamingActive.value = false; scroll() }
+    if (store.sessionId === sidAtSend) {
+      const target = messages.value.find(m => m._key === assistantMsg._key)
+      if (target) target.error = err
+    }
+  } finally { loading.value = false; streamingActive.value = false; sendingSessionId.value = null; scroll() }
 }
 
 async function newChat() {
