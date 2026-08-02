@@ -45,6 +45,7 @@ _try_include("app.api.config_api", "/api/config")
 _try_include("app.api.auth_api", "/api/auth")
 _try_include("app.api.health_api", "/api/health & /api/health/ready & /api/metrics")
 _try_include("app.api.audit_api", "/api/audit（仅管理员）")
+_try_include("app.api.usage_api", "/api/usage（仅管理员）")
 
 
 # ── 启动自检 ──────────────────────────────────────────────────

@@ -16,6 +16,7 @@
 - **用户账号与数据隔离**:开放注册/登录(JWT 认证),每个用户的会话与上传文件互相隔离;LLM/DB 配置全局共享(管理员配置一次即可)。
 - **可观测性**:结构化 JSON 日志(每个请求记录 method/path/status/耗时)、`/api/metrics` 请求数/错误率/耗时分位数(P50/P95/P99)、健康检查分 liveness(`/api/health`)与 readiness(`/api/health/ready`,检查 SQLite 与数据目录)。
 - **审计日志(合规留痕)**:SQL 查询(含上传文件查询)、LLM/DB 配置变更、用户操作(注册/登录/改密/角色变更/注销)、会话操作、文件上传全部留痕,只追加不可修改,detail 不含明文密钥;`/api/audit` 仅管理员可查(支持按 action/username 过滤)。
+- **token 用量计量(省钱)**:每轮 LLM 调用的 input/output token 与成本估算自动落库(内置 openai/anthropic/qwen 价格表,未知模型兜底估算);管理端报表 `/api/usage`(按天/按用户/按模型/明细);日/月预算配置与告警(超 80% 日志告警),chat 入口超限自动拒绝(BUDGET_LIMIT)。
 - **UI**:白黑主题、通栏布局(会话栏贴左、对话区贴右)。
 
 ## 🧱 技术栈
@@ -121,7 +122,7 @@ npm run dev
 ## 🧪 自动化测试
 
 ```bash
-# 后端 pytest（核心逻辑单测 + 认证接口集成，161 例）
+# 后端 pytest（核心逻辑单测 + 认证接口集成，178 例）
 cd backend
 pip install -r requirements-dev.txt   # 首次
 python -m pytest tests/
