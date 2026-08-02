@@ -34,9 +34,11 @@ VIZ_TOOL_NAMES = ("make_chart", "generate_chart", "auto_analyze_and_visualize")
 FILE_TOOL_NAMES = ("list_files", "query_file", "file_stats")
 
 
-def _make_expert_tool(name: str, description: str, llm, tools: list, system_prompt: str):
+def _make_expert_tool(name: str, description: str, llm, tools: list, system_prompt: str,
+                      trace=None):
     """构造专家入口工具：内部用专家的显式子图执行任务，返回结果字符串。"""
-    subgraph = make_graph(llm, tools)  # 编译一次，重复调用复用
+    # 与主管共享同一个 trace 采集器，专家内部工具调用也进入全链路轨迹
+    subgraph = make_graph(llm, tools, trace=trace, agent_name=name)
 
     @tool
     def expert(request: str) -> str:
@@ -50,7 +52,7 @@ def _make_expert_tool(name: str, description: str, llm, tools: list, system_prom
     return expert
 
 
-def make_agent(llm, all_tools: list):
+def make_agent(llm, all_tools: list, trace=None):
     """构建多智能体主管图。
 
     - all_tools：全量工具列表（make_tools 产物），按名称分给三个专家
@@ -66,18 +68,21 @@ def make_agent(llm, all_tools: list):
     if sql_tools:
         supervisor_tools.append(_make_expert_tool(
             "sql_expert", "处理所有需要查询 MySQL 数据库的任务（列库、看表结构、执行 SQL 统计/分析）。"
-                          "入参 request 为给专家的完整任务描述。", llm, sql_tools, SQL_EXPERT_PROMPT))
+                          "入参 request 为给专家的完整任务描述。", llm, sql_tools,
+                          SQL_EXPERT_PROMPT, trace))
     if viz_tools:
         supervisor_tools.append(_make_expert_tool(
             "viz_expert", "生成图表/可视化（柱状、折线、饼图等）。数据需先由 sql_expert/file_expert 或用户提供。"
-                          "入参 request 为给专家的完整任务描述（含数据）。", llm, viz_tools, VIZ_EXPERT_PROMPT))
+                          "入参 request 为给专家的完整任务描述（含数据）。", llm, viz_tools,
+                          VIZ_EXPERT_PROMPT, trace))
     if file_tools:
         supervisor_tools.append(_make_expert_tool(
             "file_expert", "分析用户上传的 CSV/Excel 文件（列、统计、SQL 查询）。"
-                           "入参 request 为给专家的完整任务描述。", llm, file_tools, FILE_EXPERT_PROMPT))
+                           "入参 request 为给专家的完整任务描述。", llm, file_tools,
+                           FILE_EXPERT_PROMPT, trace))
 
     if len(supervisor_tools) <= 1:
         # 专家太少：多智能体没有分派价值，回退单 Agent（全量工具 + 原 system prompt 由调用方决定）
-        return make_graph(llm, all_tools), SUPERVISOR_PROMPT
+        return make_graph(llm, all_tools, trace=trace, agent_name="agent"), SUPERVISOR_PROMPT
 
-    return make_graph(llm, supervisor_tools), SUPERVISOR_PROMPT
+    return make_graph(llm, supervisor_tools, trace=trace, agent_name="supervisor"), SUPERVISOR_PROMPT

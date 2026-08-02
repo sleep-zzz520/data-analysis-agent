@@ -34,8 +34,14 @@ def _filter_new_messages(input_messages: list, result_messages: list) -> list:
     return result_messages[len(input_messages):]
 
 
-def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS):
-    """构造显式编排的 Agent 图。签名与 create_react_agent 用法兼容（chat_api 无需改动）。"""
+def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
+               trace: "TraceCollector | None" = None, agent_name: str = "agent"):
+    """构造显式编排的 Agent 图。签名与 create_react_agent 用法兼容（chat_api 无需改动）。
+
+    trace：可选轨迹采集器（多智能体模式下主管/专家共享同一个，
+           tools 节点自动埋点，得到全链路工具调用链）。
+    agent_name：本图所属 Agent 名称，用于轨迹标注（默认单 Agent 场景为 "agent"）。
+    """
     tool_map = {t.name: t for t in tools}
     bound_model = llm.bind_tools(tools)
 
@@ -59,17 +65,27 @@ def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS):
         outs: list = []
         for tc in tool_calls:
             fn = tool_map.get(tc.get("name"))
+            entry = None
+            if trace is not None:
+                entry = trace.begin(agent_name, tc.get("name") or "?",
+                                    tc.get("args") or {})
             if fn is None:
                 outs.append(ToolMessage(
                     content=f"错误：未知工具「{tc.get('name')}」，请使用可用工具。",
                     tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                if entry is not None:
+                    trace.end(entry, "错误：未知工具", status="error")
                 continue
             try:
                 result = fn.invoke(tc.get("args") or {})
                 outs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                if entry is not None:
+                    trace.end(entry, result, status="ok")
             except Exception as e:  # noqa: BLE001 —— 工具异常统一转 ToolMessage，交给 LLM 反思
                 outs.append(ToolMessage(
                     content=f"工具执行异常：{e}", tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                if entry is not None:
+                    trace.end(entry, f"工具执行异常：{e}", status="error")
 
         # 轻量反思：查询类工具失败/被调用次数达上限 → 强制停止查询，基于已有信息回答
         attempts = int(state.get("sql_attempts", 0))

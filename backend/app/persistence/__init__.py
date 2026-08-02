@@ -73,6 +73,13 @@ def _conn() -> sqlite3.Connection:
             preview_rows TEXT,               -- JSON：前 5 行预览
             created_at   TEXT DEFAULT (datetime('now','localtime'))
         );
+        CREATE TABLE IF NOT EXISTS traces (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            turn_seq   INTEGER NOT NULL,      -- 该会话内轮次序号（与消息轮次对齐）
+            data       TEXT    NOT NULL,      -- JSON：该轮完整轨迹数组
+            UNIQUE(session_id, turn_seq)
+        );
         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             username      TEXT NOT NULL UNIQUE,
@@ -252,6 +259,55 @@ def load_session(session_id: str, user_id: Optional[int] = None) -> list:
                 (session_id, user_id),
             ).fetchall()
             return [_deser(r["role"], r["content"], r["extra"]) for r in rows]
+        finally:
+            conn.close()
+
+
+def save_trace(session_id: str, entries: list, user_id: Optional[int] = None) -> bool:
+    """把一轮对话的 Agent 轨迹写入 SQLite（按轮次 upsert，幂等）。
+
+    轮次序号取"该会话当前用户消息数 - 1"，与 get_display_messages 的轮次
+    （每轮一条 user + 一条 assistant）对齐，重开会话可原样回放。
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            # 多租户隔离：会话不存在或不属于该用户则不写入
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE id=? AND user_id IS ?",
+                (session_id, user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            turn_seq = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'",
+                (session_id,),
+            ).fetchone()[0] - 1
+            if turn_seq < 0:
+                return False
+            conn.execute(
+                "INSERT OR REPLACE INTO traces(session_id, turn_seq, data) VALUES (?,?,?)",
+                (session_id, turn_seq, json.dumps(entries, ensure_ascii=False)),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def load_traces(session_id: str, user_id: Optional[int] = None) -> List[List[Dict[str, Any]]]:
+    """按轮次顺序加载该会话的 Agent 轨迹（每轮一个数组，可能为空数组）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT t.data FROM traces t "
+                "JOIN sessions s ON s.id = t.session_id "
+                "WHERE t.session_id=? AND s.user_id IS ? "
+                "ORDER BY t.turn_seq",
+                (session_id, user_id),
+            ).fetchall()
+            return [json.loads(r["data"]) for r in rows]
         finally:
             conn.close()
 

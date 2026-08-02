@@ -140,6 +140,8 @@
                     
                 <!-- AI回复的SQL/表格/图表/错误 -->
                 <template v-if="m.role === 'assistant'">
+                  <!-- Agent 轨迹：实时展示本轮工具调用链（简历演示亮点） -->
+                  <AgentTrace v-if="(m.trace || []).length" :entries="m.trace" />
                   <details v-if="m.sql" class="sql"><summary>查看生成的 SQL</summary><pre>{{ m.sql }}</pre></details>
                   <template v-for="(tbl, ti) in (m.tables || [])" :key="'t' + ti">
                     <DataTable :table="tbl" />
@@ -233,6 +235,7 @@ import ChartView from '../components/ChartView.vue'
 import DataTable from '../components/DataTable.vue'
 import ErrorBanner from '../components/ErrorBanner.vue'
 import MarkdownContent from '../components/MarkdownContent.vue'
+import AgentTrace from '../components/AgentTrace.vue'
 
 const router = useRouter()
 const store = useConfigStore()
@@ -251,7 +254,10 @@ const sendingSessionId = ref(null)  // 发送中的会话：切换会话后隐�
 // 发送中未落库的本地消息（sessionId -> 消息数组）：切走再切回不丢用户气泡
 const pendingMsgs = ref(new Map())
 let msgSeq = 0
-const mkMsg = (role, text = '') => ({ role, text, timestamp: new Date().toISOString(), _key: `m${++msgSeq}` })
+const mkMsg = (role, text = '') => ({
+  role, text, timestamp: new Date().toISOString(), _key: `m${++msgSeq}`,
+  trace: role === 'assistant' ? [] : undefined
+})
 
 // 会话加载竞态保护：快速切换会话时，只应用最后一次请求的结果，
 // 避免慢响应覆盖新会话的消息（串话）。
@@ -303,6 +309,8 @@ async function loadSession(sid, silent = false) {
   try {
     const data = await chatApi.getSession(sid)
     if (mySeq !== loadSeq) return  // 已有更新的加载请求，丢弃本次结果
+    const traces = data.traces || []
+    let traceIdx = 0
     messages.value = (data.messages || []).map(m => ({
       role: m.role,
       text: m.text || '',
@@ -310,6 +318,8 @@ async function loadSession(sid, silent = false) {
       tables: m.tables || (m.table ? [m.table] : []),
       visuals: (m.visuals || (m.chart ? [{ chart: m.chart, image: m.imageBase64 }] : []))
         .map(v => ({ chart: parseChartConfig(v.chart), image: v.image || null })),
+      // 轨迹按轮次与 assistant 消息一一对应（后端每轮都落一条，可能为空数组）
+      trace: m.role === 'assistant' ? (traces[traceIdx++] || []) : undefined,
       timestamp: m.timestamp || new Date().toISOString()
     }))
     // 合并发送中未落库的本地消息（用户气泡不因切会话丢失）
@@ -421,11 +431,18 @@ async function send() {
           streamingActive.value = true
           target.text += t
         },
+        onTrace: (entries) => {
+          if (store.sessionId !== sidAtSend) return
+          const target = messages.value.find(m => m._key === assistantMsg._key)
+          if (!target) return
+          target.trace = (target.trace || []).concat(entries)
+        },
         onDone: (res) => {
           if (store.sessionId !== sidAtSend) return  // 发送期间切换了会话：不显示，消息已落库
           if (res.session_id) store.setSession(res.session_id)
           const msg = messages.value.find(m => m._key === assistantMsg._key)
           if (!msg) return
+          msg.trace = res.trace || msg.trace || []
           msg.sql = res.sql || null
           // 一轮可能有多张图表/表格（visuals/tables 数组），兼容旧字段
           msg.tables = res.tables || (res.table ? [res.table] : [])

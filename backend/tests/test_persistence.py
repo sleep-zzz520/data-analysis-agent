@@ -8,6 +8,7 @@ from app.persistence import (
     update_password, delete_user, claim_orphan_data,
     persist_messages, load_session, list_sessions, delete_session,
     rename_session, get_session_info, save_upload, get_upload,
+    save_trace, load_traces,
 )
 from app.auth import hash_password
 
@@ -97,6 +98,40 @@ def test_claim_orphan_data(isolated_storage):
     persist_messages("orphan-session", [HumanMessage(content="无人认领")], user_id=None)
     claim_orphan_data(u["id"])
     assert get_session_info("orphan-session", u["id"]) is not None
+
+
+# ── Agent 轨迹（traces 表）───────────────────────────────────────────────────
+def test_save_and_load_traces_roundtrip(isolated_storage):
+    u = create_user("alice", "h")
+    sid = "trace-session"
+    persist_messages(sid, [HumanMessage(content="q1"), AIMessage(content="a1")], user_id=u["id"])
+    assert save_trace(sid, [{"seq": 1, "tool": "query_mysql"}], u["id"]) is True
+    # 第二轮：turn_seq 应自动对齐到 1（第一轮为 0）
+    persist_messages(sid, [
+        HumanMessage(content="q1"), AIMessage(content="a1"),
+        HumanMessage(content="q2"), AIMessage(content="a2"),
+    ], user_id=u["id"])
+    assert save_trace(sid, [{"seq": 1, "tool": "make_chart"}], u["id"]) is True
+    traces = load_traces(sid, u["id"])
+    assert [t[0]["tool"] for t in traces] == ["query_mysql", "make_chart"]
+
+
+def test_traces_user_isolated(isolated_storage):
+    u1 = create_user("alice", "h")
+    u2 = create_user("bob", "h")
+    persist_messages("s1", [HumanMessage(content="q"), AIMessage(content="a")], user_id=u1["id"])
+    assert save_trace("s1", [{"tool": "x"}], u1["id"]) is True
+    # 其他用户不可读，也不可写
+    assert load_traces("s1", u2["id"]) == []
+    assert save_trace("s1", [{"tool": "x"}], u2["id"]) is False
+
+
+def test_traces_cascade_deleted_with_session(isolated_storage):
+    u = create_user("alice", "h")
+    persist_messages("s1", [HumanMessage(content="q"), AIMessage(content="a")], user_id=u["id"])
+    save_trace("s1", [{"tool": "x"}], u["id"])
+    assert delete_session("s1", u["id"]) is True
+    assert load_traces("s1", u["id"]) == []
 
 
 def test_claim_orphan_then_load_session_visible(isolated_storage):

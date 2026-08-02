@@ -24,6 +24,7 @@ from app.db.schema import list_tables
 from app.memory import get_history, save_messages, clear_session
 from app.memory.store import budget_history, estimate_tokens, MAX_TOKENS
 from app.agent.graph import _filter_new_messages
+from app.agent.trace import TraceCollector
 from app.agent.prompts import SUPERVISOR_PROMPT, CONVERSATION_HINT
 # ── 对话记录持久化（SQLite 镜像，不影响现有记忆系统）─────────────────────────
 from app.persistence import (
@@ -36,6 +37,8 @@ from app.persistence import (
     get_session_info,
     save_upload,
     get_upload,
+    save_trace,
+    load_traces,
 )
 from app.api.auth_api import get_current_user
 
@@ -203,7 +206,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
-            graph, supervisor_prompt = make_agent(llm, tools)
+            trace = TraceCollector()
+            graph, supervisor_prompt = make_agent(llm, tools, trace=trace)
 
             ctx = ""
             for fid in req.file_ids:
@@ -240,6 +244,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
 
             # ── 持久化：把内存 store 的完整历史同步到 SQLite（幂等去重）────
             persist_messages(sid, get_history(sid), user["uid"])
+            # ── Agent 轨迹落库：重开会话可回看工具调用链 ────────────────
+            save_trace(sid, trace.snapshot(), user["uid"])
 
             msgs = result_messages
             visuals, tables, sql = _extract(msgs)
@@ -267,6 +273,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 "table": tables[-1] if tables else None,
                 "sql": sql,
                 "session_id": sid,
+                "trace": trace.snapshot(),
             }
         except Exception as e:
             return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid, "error": classify_any(e)}
@@ -283,6 +290,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 
     事件类型（JSON 的 type 字段）：
       - delta: {"type":"delta","text":"..."}      回复文本增量
+      - trace: {"type":"trace","entries":[...]}   本轮工具调用链增量（实时展示）
       - done:  {"type":"done","reply","chart","table","sql","session_id"}  最终结果
       - error: {"type":"error","error":{...},"session_id"}                 异常
     """
@@ -316,7 +324,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                    audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
-                graph, supervisor_prompt = make_agent(llm, tools)
+                trace = TraceCollector()
+                graph, supervisor_prompt = make_agent(llm, tools, trace=trace)
 
                 ctx = ""
                 for fid in req.file_ids:
@@ -342,6 +351,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 #  - "messages"：token 级文本 → 推送给前端（打字机效果）
                 #  - "updates" ：每步完整消息 → 本地收集，用于保存/提取图表
                 all_new: List = []
+                trace_sent: int = 0
                 async for mode, data in graph.astream(
                     {"messages": input_messages},
                     stream_mode=["messages", "updates"],
@@ -355,6 +365,11 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                             msgs = val.get("messages") or []
                             if msgs:
                                 all_new.extend(msgs)
+                        # 该节点已完成：把新增的工具调用链增量推给前端（实时时间线）
+                        entries = trace.snapshot()
+                        if len(entries) > trace_sent:
+                            yield _sse({"type": "trace", "entries": entries[trace_sent:]})
+                            trace_sent = len(entries)
 
                 # ── 保存（内存 + SQLite），与同步接口一致 ────────────────
                 user_msg = HumanMessage(content=user_text, id=str(uuid.uuid4()))
@@ -363,6 +378,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                         m.id = str(uuid.uuid4())
                 save_messages(sid, [user_msg] + list(all_new))
                 persist_messages(sid, get_history(sid), user["uid"])
+                # ── Agent 轨迹落库：重开会话可回看工具调用链 ────────────
+                save_trace(sid, trace.snapshot(), user["uid"])
 
                 # ── 提取图表/SQL，发送最终结果 ────────────────────────────
                 result_messages = list(input_messages) + list(all_new)
@@ -396,6 +413,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     "table": tables[-1] if tables else None,
                     "sql": sql,
                     "session_id": sid,
+                    "trace": trace.snapshot(),
                 })
             except Exception as e:
                 yield _sse({"type": "error", "error": classify_any(e), "session_id": sid})
@@ -461,6 +479,8 @@ def api_get_session(session_id: str, user: dict = Depends(get_current_user)):
     if info is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     info["messages"] = get_display_messages(session_id)
+    # Agent 轨迹：按轮次与 assistant 消息一一对应（重开聊天页可回放调用链）
+    info["traces"] = load_traces(session_id, user["uid"])
     return info
 
 

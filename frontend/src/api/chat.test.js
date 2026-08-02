@@ -46,6 +46,19 @@ describe('streamChat SSE 解析', () => {
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: 'LLM_QUOTA' }))
   })
 
+  it('trace 帧回调 onTrace（工具调用链实时增量）', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
+      { type: 'trace', entries: [{ seq: 1, tool: 'sql_expert', status: 'ok' }] },
+      { type: 'trace', entries: [{ seq: 2, tool: 'query_mysql', status: 'ok' }] },
+      { type: 'done', session_id: 's1', reply: 'ok' }
+    ])))
+    const onTrace = vi.fn()
+    await streamChat({ message: 'hi' }, { onTrace })
+    expect(onTrace).toHaveBeenCalledTimes(2)
+    expect(onTrace.mock.calls[0][0]).toEqual([{ seq: 1, tool: 'sql_expert', status: 'ok' }])
+    expect(onTrace.mock.calls[1][0][0].tool).toBe('query_mysql')
+  })
+
   it('非 2xx 响应 → onError + 抛错', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('boom', { status: 500 })))
     const onError = vi.fn()

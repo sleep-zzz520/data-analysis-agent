@@ -1,8 +1,8 @@
 import http from './http.js'
 export const chat = (payload) => http.post('/api/chat', payload)
 
-// 流式对话（SSE）：回调 onDelta(文本增量) / onDone(最终结果) / onError(错误对象)
-export async function streamChat(payload, { onDelta, onDone, onError } = {}) {
+// 流式对话（SSE）：回调 onDelta(文本增量) / onTrace(轨迹增量) / onDone(最终结果) / onError(错误对象)
+export async function streamChat(payload, { onDelta, onTrace, onDone, onError } = {}) {
   let resp
   try {
     resp = await fetch('/api/chat/stream', {
@@ -40,6 +40,7 @@ export async function streamChat(payload, { onDelta, onDone, onError } = {}) {
         let ev
         try { ev = JSON.parse(line.slice(6)) } catch (_) { continue }
         if (ev.type === 'delta' && onDelta) onDelta(ev.text || '')
+        else if (ev.type === 'trace' && onTrace) onTrace(ev.entries || [])
         else if (ev.type === 'done' && onDone) onDone(ev)
         else if (ev.type === 'error' && onError) onError(ev.error)
       }
