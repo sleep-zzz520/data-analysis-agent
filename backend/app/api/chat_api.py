@@ -75,9 +75,14 @@ def _load_uploaded_dfs(file_ids: List, user_id: int) -> dict:
 # 每个 session 一个 asyncio 锁：串行化同一会话的对话处理，
 # 避免并发请求交错读写内存/SQLite 导致消息错乱（串话、重复）。
 _chat_locks: dict = {}
-_chat_locks_guard = asyncio.Lock()
+_chat_locks_guard: "asyncio.Lock | None" = None
 
 async def _session_lock(sid: str) -> asyncio.Lock:
+    global _chat_locks_guard
+    # 惰性创建：asyncio.Lock 在 Python 3.9 构造时绑定当前事件循环，
+    # 模块级直接创建会导致无事件循环的环境（pytest/脚本）导入即崩。
+    if _chat_locks_guard is None:
+        _chat_locks_guard = asyncio.Lock()
     async with _chat_locks_guard:
         lock = _chat_locks.get(sid)
         if lock is None:

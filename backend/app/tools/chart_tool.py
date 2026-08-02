@@ -21,10 +21,16 @@
 import io
 import base64
 import json
+import os
 import re
+from pathlib import Path
 from typing import Optional, Dict, List, Union
 import pandas as pd
 import numpy as np
+
+# matplotlib 字体/配置缓存：~/.matplotlib 常不可写（容器/CI），
+# 改用项目内目录，避免每次启动重建缓存（拖慢 5-10 秒）。必须在本模块 import matplotlib 之前设置。
+os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parents[2] / "data" / ".matplotlib"))
 
 # matplotlib + seaborn (静态图)
 import matplotlib
