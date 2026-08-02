@@ -116,6 +116,22 @@ npm run dev
 2. 新增**数据库配置**(MySQL 主机/端口/账号,建议用只读账号)。
 3. 回到「分析对话」,提问或上传 CSV/Excel 分析。
 
+## 🧪 自动化测试
+
+```bash
+# 后端 pytest（核心逻辑单测 + 认证接口集成，132 例）
+cd backend
+pip install -r requirements-dev.txt   # 首次
+python -m pytest tests/
+
+# 前端 vitest（拦截器 / SSE 解析 / 组件 / 路由守卫 / store，26 例）
+cd frontend
+npm install          # 首次
+npm test
+```
+
+> 测试全程隔离：后端把 SQLite / 配置 JSON / JWT 密钥重定向到临时目录，不触碰真实 `backend/data/`；前端在 happy-dom 环境运行，不启动后端。CI（GitHub Actions）已包含两端测试步骤。
+
 ## 💬 使用示例
 
 - 数据库分析:`上个月各状态的订单数?` → Agent 查库返回表格 + 洞察

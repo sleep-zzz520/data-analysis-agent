@@ -51,6 +51,7 @@ def login(req: AuthReq):
     user = get_user_by_username(req.username.strip())
     if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(401, "用户名或密码错误")
+    claim_orphan_data(user["id"])  # 存量无主会话/上传归给本人，避免升级后历史会话不可见
     return {"ok": True, "token": create_token(user["id"], user["username"], user["role"]), "username": user["username"], "role": user["role"]}
 
 

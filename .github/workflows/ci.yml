@@ -7,7 +7,7 @@ on:
 
 jobs:
   backend:
-    name: 后端 语法 & 启动冒烟
+    name: 后端 单测 & 启动冒烟
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -20,13 +20,16 @@ jobs:
           python-version: "3.9"
 
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-dev.txt
 
       - name: 语法检查
         run: python -m compileall app
 
       - name: 模块导入检查
         run: python -c "from app.main import app; assert app.title"
+
+      - name: pytest 单测（核心逻辑）
+        run: python -m pytest tests/
 
       - name: 启动冒烟测试（/api/health）
         run: |
@@ -38,7 +41,7 @@ jobs:
           echo "--- 后端日志 ---"; cat /tmp/backend.log; exit 1
 
   frontend:
-    name: 前端 构建
+    name: 前端 单测 & 构建
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -54,6 +57,9 @@ jobs:
 
       - name: 安装依赖
         run: npm ci
+
+      - name: vitest 基础测试
+        run: npm test
 
       - name: 生产构建
         run: npm run build

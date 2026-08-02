@@ -238,13 +238,17 @@ def _fingerprint(role: str, content: str, extra: Optional[str]) -> str:
 
 
 def load_session(session_id: str, user_id: Optional[int] = None) -> list:
-    """从 SQLite 加载完整 LangChain Message 列表（用于恢复内存 store）。"""
+    """从 SQLite 加载完整 LangChain Message 列表（用于恢复内存 store）。
+
+    user_id 归属校验走 sessions 表（messages 表本身没有 user_id 列）。
+    """
     with _lock:
         conn = _conn()
         try:
             rows = conn.execute(
-                "SELECT role, content, extra FROM messages "
-                "WHERE session_id=? AND user_id IS ? ORDER BY seq",
+                "SELECT m.role, m.content, m.extra FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id=? AND s.user_id IS ? ORDER BY m.seq",
                 (session_id, user_id),
             ).fetchall()
             return [_deser(r["role"], r["content"], r["extra"]) for r in rows]
