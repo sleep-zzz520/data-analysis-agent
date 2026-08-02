@@ -44,6 +44,23 @@ def test_trim_excess_turns():
     assert msgs[0].content == "q2"  # 保留的是后两轮
 
 
+def test_trim_by_token_budget():
+    # 小预算 → 按 token 裁剪（头部被裁，保留最近的）
+    s = ConversationStore(max_turns=200, max_tokens=10)
+    for i in range(4):
+        s.save("a", [HumanMessage(content=f"问题{i}"), AIMessage(content=f"回答{i}")])
+    msgs = s.get("a")
+    assert msgs[-1].content == "回答3"  # 保留最近的
+    assert len(msgs) < 8  # 预算 10 token 装不下全部
+
+
+def test_trim_token_budget_keeps_at_least_one():
+    s = ConversationStore(max_turns=200, max_tokens=1)
+    s.save("a", [HumanMessage(content="x"), AIMessage(content="y")])
+    msgs = s.get("a")
+    assert len(msgs) == 1 and msgs[0].content == "y"  # 至少保留最后一条
+
+
 def test_trim_no_cut_when_within_limit():
     s = ConversationStore(max_turns=10)
     s.save("a", _mk())

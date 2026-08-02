@@ -92,3 +92,23 @@ def test_make_chart_bar():
 def test_make_tools_registers_core_tools():
     names = [t.name for t in make_tools(engine=None)]
     assert names[:4] == ["list_schemas", "get_schema", "query_mysql", "make_chart"]
+
+
+# ── 长工具输出压缩 ────────────────────────────────────────────────────────────
+def test_query_mysql_compresses_long_output(monkeypatch):
+    # 600 行结果 → markdown 只展示 50 行 + 省略提示；machine rows 仍 200（前端表格完整）
+    monkeypatch.setattr(pd, "read_sql", lambda sql, engine: pd.DataFrame({"idx": range(600)}))
+    tools = {t.name: t for t in make_tools(engine=None)}
+    out = tools["query_mysql"].invoke({"sql": "SELECT * FROM t"})
+    assert "已省略" in out
+    machine = json.loads(out.split("<!--TABLE:")[1].rstrip("-->"))
+    assert len(machine["rows"]) == 200
+
+
+def test_query_mysql_short_output_not_omitted(monkeypatch):
+    monkeypatch.setattr(pd, "read_sql", lambda sql, engine: pd.DataFrame({"idx": range(10)}))
+    tools = {t.name: t for t in make_tools(engine=None)}
+    out = tools["query_mysql"].invoke({"sql": "SELECT * FROM t"})
+    assert "已省略" not in out
+    assert "| 9 |" in out
+

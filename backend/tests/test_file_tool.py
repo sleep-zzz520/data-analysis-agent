@@ -54,11 +54,14 @@ def test_query_file_rejects_multiple_statements():
 
 
 def test_query_file_adds_limit(monkeypatch):
-    # 600 行数据不带 LIMIT → 自动追加 LIMIT 500，结果只返回 500 行
+    # 600 行数据不带 LIMIT → 自动追加 LIMIT 500（结果 500 行），
+    # 且 markdown 输出被压缩（展示 50 行、省略 450 行）
     df = pd.DataFrame({"idx": range(600)})
     tools = make_file_tools({"big.csv": df})
     out = tools[1].invoke({"file": "big.csv", "sql": "SELECT idx FROM df"})
-    assert "| 499 |" in out and "| 500 |" not in out
+    assert "已省略 450 行" in out  # LIMIT 500 生效 + 长输出压缩
+    machine = json.loads(out.split("<!--TABLE:")[1].rstrip("-->"))
+    assert len(machine["rows"]) == 200  # 前端表格数据完整
 
 
 def test_query_file_sql_error_returns_friendly():
@@ -85,3 +88,19 @@ def test_to_md_handles_nan():
     df = pd.DataFrame({"col": [1, None]})
     md = _to_md(df)
     assert "nan" not in md.lower()
+
+
+def test_to_md_max_rows_omits_and_notes():
+    df = pd.DataFrame({"idx": range(100)})
+    md = _to_md(df, max_rows=50)
+    assert "已省略 50 行" in md and "仅展示前 50 行" in md
+    assert "| 49 |" in md and "| 50 |" not in md
+
+
+def test_query_file_compresses_long_output():
+    df = pd.DataFrame({"idx": range(600)})
+    tools = {t.name: t for t in make_file_tools({"big.csv": df})}
+    out = tools["query_file"].invoke({"file": "big.csv", "sql": "SELECT idx FROM df"})
+    assert "已省略" in out
+    machine = json.loads(out.split("<!--TABLE:")[1].rstrip("-->"))
+    assert len(machine["rows"]) == 200  # 前端表格仍完整

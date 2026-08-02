@@ -17,6 +17,10 @@
 - **可观测性**:结构化 JSON 日志(每个请求记录 method/path/status/耗时)、`/api/metrics` 请求数/错误率/耗时分位数(P50/P95/P99)、健康检查分 liveness(`/api/health`)与 readiness(`/api/health/ready`,检查 SQLite 与数据目录)。
 - **审计日志(合规留痕)**:SQL 查询(含上传文件查询)、LLM/DB 配置变更、用户操作(注册/登录/改密/角色变更/注销)、会话操作、文件上传全部留痕,只追加不可修改,detail 不含明文密钥;`/api/audit` 仅管理员可查(支持按 action/username 过滤)。
 - **token 用量计量(省钱)**:每轮 LLM 调用的 input/output token 与成本估算自动落库(内置 openai/anthropic/qwen 价格表,未知模型兜底估算);管理端报表 `/api/usage`(按天/按用户/按模型/明细);日/月预算配置与告警(超 80% 日志告警),chat 入口超限自动拒绝(BUDGET_LIMIT)。
+- **上下文压缩(省钱+丝滑)**:token 预算制截断替代纯轮数截断(默认 8k token 预算,按近似估算从头部裁剪历史,保留最近对话);长工具输出压缩(query 结果 markdown 最多展示 50 行并提示省略,前端表格仍完整)。
+- **显式 Agent 图编排(核心能力)**:手写 LangGraph StateGraph 替代 create_react_agent 黑盒——`agent`(LLM 决策,逐 token 流式)/`tools`(执行工具调用)节点 + 条件边;状态含 `sql_attempts` 轻量反思(查询工具连续失败达上限自动注入提示强制收敛,防死循环);节点/状态全显式可观测,为轨迹可视化打基础。
+- **多智能体协作(核心能力)**:Supervisor 主管-专家架构——主管 Agent 按任务分派给 SQL 专家(查库)/可视化专家(出图)/文件专家(上传文件分析),每个专家是独立显式子图(自己的工具集 + 专家 prompt),主管可串联多专家(先查库再画图);无上传文件时自动降级为 2 专家,专家过少回退单 Agent。
+- **Agent 记忆(核心能力)**:三件套——①长期记忆:LLM 从对话提取用户偏好/常用库等跨会话事实(信号词触发 + 10 分钟节流防烧钱),每次对话自动注入;②会话摘要:每 5 轮用 LLM 压缩历史为结构化摘要,新会话快速定位;③记忆检索:按用户问题关键词从历史消息按需检索注入(纯规则零成本),替代整段重放。
 - **UI**:白黑主题、通栏布局(会话栏贴左、对话区贴右)。
 
 ## 🧱 技术栈
@@ -122,7 +126,7 @@ npm run dev
 ## 🧪 自动化测试
 
 ```bash
-# 后端 pytest（核心逻辑单测 + 认证接口集成，178 例）
+# 后端 pytest（核心逻辑单测 + 认证接口集成，232 例）
 cd backend
 pip install -r requirements-dev.txt   # 首次
 python -m pytest tests/

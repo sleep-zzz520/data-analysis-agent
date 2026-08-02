@@ -1,4 +1,4 @@
-"""基于内存的会话存储，支持 LRU 淘汰 + 最大轮次数截断。"""
+"""基于内存的会话存储，支持 LRU 淘汰 + token 预算制截断。"""
 from __future__ import annotations
 
 import threading
@@ -6,14 +6,48 @@ import time
 from collections import OrderedDict
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
-# 一条消息保留的最大轮次（user+assistant 各算 1 条，tool 消息跟随）
-MAX_TURNS = 50
+# 上下文 token 预算（输入历史 + 当前消息的总预算，近似值，无 tokenizer 依赖）
+MAX_TOKENS = 8000
+
+# 兜底：消息绝对轮数上限（防止极端短消息导致预算内无限堆积；预算优先）
+MAX_TURNS = 200
 
 # 最多同时保活的 session 数
 MAX_SESSIONS = 200
 
 # session 空闲多久后过期（秒）—— 默认 4 小时
 SESSION_TTL_SECONDS = 4 * 3600
+
+
+def estimate_tokens(text) -> int:
+    """近似 token 估算：中文约 1 字≈1.5 token，其余约 4 字符≈1 token。
+
+    无 tokenizer 依赖的保守估算（偏大，宁可多裁）；纯函数可单测。
+    """
+    if not text:
+        return 0
+    # CJK 字符计 1.5，其余按 4 字符/token（ASCII 平均偏保守）
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    other = len(text) - cjk
+    return max(1, int(cjk * 1.5 + other / 4))
+
+
+def budget_history(messages: list, budget: int) -> list:
+    """按 token 预算从头部裁剪历史，保留最近的会话内容。
+
+    返回新的消息列表（不修改入参）；至少保留最后一条消息，避免空历史。
+    """
+    if budget <= 0 or not messages:
+        return messages
+    keep: list = []
+    used = 0
+    for m in reversed(messages):
+        cost = estimate_tokens(getattr(m, "content", None) or "")
+        if keep and used + cost > budget:
+            break
+        keep.insert(0, m)
+        used += cost
+    return keep
 
 
 class ConversationStore:
@@ -24,10 +58,12 @@ class ConversationStore:
         max_turns: int = MAX_TURNS,
         max_sessions: int = MAX_SESSIONS,
         ttl: int = SESSION_TTL_SECONDS,
+        max_tokens: int = MAX_TOKENS,
     ):
         self._max_turns = max_turns
         self._max_sessions = max_sessions
         self._ttl = ttl
+        self._max_tokens = max_tokens
         # key: session_id, value: {"messages": [...], "last_access": timestamp}
         self._data: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.Lock()
@@ -89,13 +125,19 @@ class ConversationStore:
     # ── internal ─────────────────────────────────────────────────────────────
 
     def _trim(self, entry: dict) -> None:
-        """当 HumanMessage 条数 > max_turns 时，从头部裁剪到 max_turns 以内。"""
+        """按 token 预算从头部裁剪（保留最近的会话内容）；轮数上限兜底。"""
         msgs = entry["messages"]
-        # 计算 HumanMessage 数量
+
+        # 1) token 预算优先：总估算超预算时从头部删消息，直到预算内
+        total = sum(estimate_tokens(getattr(m, "content", None) or "") for m in msgs)
+        while total > self._max_tokens and len(msgs) > 1:
+            total -= estimate_tokens(getattr(msgs[0], "content", None) or "")
+            msgs.pop(0)
+
+        # 2) 轮数兜底：HumanMessage 条数 > max_turns 时仍裁剪（极端短消息场景）
         human_count = sum(1 for m in msgs if isinstance(m, HumanMessage))
         if human_count <= self._max_turns:
             return
-        # 找到要保留的第一条 HumanMessage 的索引
         to_remove = human_count - self._max_turns
         removed = 0
         cut_idx = 0

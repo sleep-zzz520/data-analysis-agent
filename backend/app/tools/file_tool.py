@@ -13,16 +13,26 @@ import pandas as pd
 import duckdb
 from langchain_core.tools import tool
 
+# 长工具输出压缩：查询结果 markdown 最多展示的行数（省 token）
+_TOOL_MAX_ROWS = 50
 
-def _to_md(df: pd.DataFrame) -> str:
-    """DataFrame → Markdown 表格（与 mysql_tool 的 query 输出格式一致）。"""
+
+def _to_md(df: pd.DataFrame, max_rows: int = None) -> str:
+    """DataFrame → Markdown 表格（与 mysql_tool 的 query 输出格式一致）。
+    max_rows 限制正文行数，超出省略并提示（压缩长工具输出，省 token）。"""
     cols = list(df.columns)
     esc = lambda v: "" if pd.isna(v) else str(v).replace("|", "\\|")
     head = "| " + " | ".join(esc(c) for c in cols) + " |"
     sep = "| " + " | ".join("---" for _ in cols) + " |"
     if len(df) == 0:
         return head + "\n" + sep + "\n| (空结果) |"
-    body = "\n".join("| " + " | ".join(esc(v) for v in row) + " |" for row in df.values.tolist())
+    rows = df.values.tolist()
+    omitted = len(rows) - max_rows if max_rows and len(rows) > max_rows else 0
+    if omitted > 0:
+        rows = rows[:max_rows]
+    body = "\n".join("| " + " | ".join(esc(v) for v in row) + " |" for row in rows)
+    if omitted > 0:
+        body += f"\n| …（共 {len(df)} 行，已省略 {omitted} 行，仅展示前 {max_rows} 行） |"
     return "\n".join([head, sep, body])
 
 
@@ -83,7 +93,7 @@ def make_file_tools(files: Dict[str, pd.DataFrame], audit_ctx: Dict | None = Non
                 "columns": list(res.columns),
                 "rows": res.head(200).where(res.notna(), None).values.tolist(),
             }
-            return _to_md(res) + f"\n<!--TABLE:{json.dumps(machine, ensure_ascii=False, default=str)}-->"
+            return _to_md(res, max_rows=_TOOL_MAX_ROWS) + f"\n<!--TABLE:{json.dumps(machine, ensure_ascii=False, default=str)}-->"
         except Exception as e:
             return f"SQL 执行错误：{e}  请修正 SQL 后重试。"
 

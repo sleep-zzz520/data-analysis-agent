@@ -13,14 +13,18 @@ from langchain_core.messages import (
 from app.meta.store import get_llm_secret, get_db_secret
 from app.core.factories import build_llm, build_engine
 from app.tools.agent_tools import make_tools
-from app.agent.graph import make_graph
+from app.agent.multi_agent import make_agent
 from app.errors.classifier import classify_any
 from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION
 from app.usage import check_budget, record_usage, extract_usage
+from app.memory.agent_memory import (
+    build_memory_context, extract_and_store_memories, summary_due, generate_summary,
+)
 from app.db.schema import list_tables
 from app.memory import get_history, save_messages, clear_session
+from app.memory.store import budget_history, estimate_tokens, MAX_TOKENS
 from app.agent.graph import _filter_new_messages
-from app.agent.prompts import SYSTEM_PROMPT, CONVERSATION_HINT
+from app.agent.prompts import SUPERVISOR_PROMPT, CONVERSATION_HINT
 # ── 对话记录持久化（SQLite 镜像，不影响现有记忆系统）─────────────────────────
 from app.persistence import (
     persist_messages,
@@ -199,7 +203,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
-            graph = make_graph(llm, tools)
+            graph, supervisor_prompt = make_agent(llm, tools)
 
             ctx = ""
             for fid in req.file_ids:
@@ -211,8 +215,16 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             # ── 多轮对话：先从 SQLite 懒加载（服务重启后自动恢复）───────────────
             _ensure_loaded(sid, user["uid"])
             history = get_history(sid)
+            # ── 上下文压缩：token 预算制截断（替代纯轮数截断），
+            # 历史 + 当前消息总估算 token 不超过预算，防止上下文无限膨胀 ──
+            system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT
+            # ── 记忆注入：长期记忆（跨会话）+ 会话摘要 + 相关历史检索 ──────
+            memory_ctx = build_memory_context(user["uid"], sid, req.message)
+            if memory_ctx:
+                system_prompt += "\n\n" + memory_ctx
+            history = budget_history(history, MAX_TOKENS - estimate_tokens(system_prompt))
             input_messages = [
-                SystemMessage(content=SYSTEM_PROMPT + "\n\n" + CONVERSATION_HINT)
+                SystemMessage(content=system_prompt)
             ] + history + [HumanMessage(content=user_text)]
 
             result = await asyncio.to_thread(graph.invoke, {"messages": input_messages})
@@ -239,6 +251,12 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             if in_t or out_t:
                 record_usage(user["uid"], user.get("username"), sid, req.llm_config_id,
                              llm_cfg.get("provider"), llm_cfg.get("model_name"), in_t, out_t)
+
+            # ── 记忆沉淀：节流提取长期事实 + 节流更新会话摘要 ────────────
+            extract_and_store_memories(llm, user["uid"], user.get("username"), sid,
+                                       req.message, reply)
+            if summary_due(sid):
+                generate_summary(llm, sid, result_messages)
 
             # chart/table 字段保留兼容（取最后一个），前端主用 visuals/tables 数组
             return {
@@ -298,7 +316,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                    audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
-                graph = make_graph(llm, tools)
+                graph, supervisor_prompt = make_agent(llm, tools)
 
                 ctx = ""
                 for fid in req.file_ids:
@@ -309,8 +327,15 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 
                 _ensure_loaded(sid, user["uid"])
                 history = get_history(sid)
+                # ── 上下文压缩：token 预算制截断（与同步接口一致）─────────
+                system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT
+                # ── 记忆注入：长期记忆 + 会话摘要 + 相关历史检索（与同步一致）─
+                memory_ctx = build_memory_context(user["uid"], sid, req.message)
+                if memory_ctx:
+                    system_prompt += "\n\n" + memory_ctx
+                history = budget_history(history, MAX_TOKENS - estimate_tokens(system_prompt))
                 input_messages = [
-                    SystemMessage(content=SYSTEM_PROMPT + "\n\n" + CONVERSATION_HINT)
+                    SystemMessage(content=system_prompt)
                 ] + history + [HumanMessage(content=user_text)]
 
                 # 双流模式：
@@ -355,6 +380,13 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     if isinstance(m, AIMessage) and m.content:
                         reply = m.content
                         break
+
+                # ── 记忆沉淀：节流提取长期事实 + 节流更新会话摘要 ──────────
+                extract_and_store_memories(llm, user["uid"], user.get("username"), sid,
+                                           req.message, reply)
+                if summary_due(sid):
+                    generate_summary(llm, sid, result_messages)
+
                 yield _sse({
                     "type": "done",
                     "reply": reply,

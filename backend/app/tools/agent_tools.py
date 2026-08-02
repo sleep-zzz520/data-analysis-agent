@@ -8,14 +8,24 @@ from app.tools.file_tool import make_file_tools
 _FORBIDDEN = re.compile(r"\b(drop|delete|update|insert|alter|truncate|create|grant|revoke)\b", re.I)
 _BARE_DASH = re.compile(r"(?<!`)(share-[A-Za-z0-9_]+)(?!`)")
 
-def _to_md(df):
+# 长工具输出压缩：查询结果 markdown 最多展示的行数（省 token，前端表格仍取 machine rows）
+_TOOL_MAX_ROWS = 50
+
+def _to_md(df, max_rows: int = None):
+    """DataFrame → Markdown 表格。max_rows 限制正文行数，超出省略并提示（压缩长输出）。"""
     cols = list(df.columns)
     esc = lambda v: "" if pd.isna(v) else str(v).replace("|", "\\|")
     head = "| " + " | ".join(esc(c) for c in cols) + " |"
     sep = "| " + " | ".join("---" for _ in cols) + " |"
     if len(df) == 0:
         return head + "\n" + sep + "\n| (空结果) |"
-    body = "\n".join("| " + " | ".join(esc(v) for v in row) + " |" for row in df.values.tolist())
+    rows = df.values.tolist()
+    omitted = len(rows) - max_rows if max_rows and len(rows) > max_rows else 0
+    if omitted > 0:
+        rows = rows[:max_rows]
+    body = "\n".join("| " + " | ".join(esc(v) for v in row) + " |" for row in rows)
+    if omitted > 0:
+        body += f"\n| …（共 {len(df)} 行，已省略 {omitted} 行，仅展示前 {max_rows} 行） |"
     return "\n".join([head, sep, body])
 
 def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
@@ -63,7 +73,7 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
             d2 = df.head(200)
             machine = {"columns": list(df.columns),
                        "rows": d2.where(d2.notna(), None).values.tolist()}
-            return _to_md(df) + f"\n<!--TABLE:{json.dumps(machine, ensure_ascii=False, default=str)}-->"
+            return _to_md(df, max_rows=_TOOL_MAX_ROWS) + f"\n<!--TABLE:{json.dumps(machine, ensure_ascii=False, default=str)}-->"
         except Exception as e:
             return f"SQL 执行错误：{e}  请根据此错误修正 SQL 后重试（最多 3 次）。"
 
