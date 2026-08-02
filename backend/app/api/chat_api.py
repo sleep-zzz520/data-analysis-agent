@@ -11,10 +11,11 @@ from langchain_core.messages import (
     HumanMessage, AIMessage, AIMessageChunk, ToolMessage, SystemMessage,
 )
 from app.meta.store import get_llm_secret, get_db_secret
-from app.core.factories import build_llm, build_engine          
+from app.core.factories import build_llm, build_engine
 from app.tools.agent_tools import make_tools
 from app.agent.graph import make_graph
-from app.errors.classifier import classify_any                  
+from app.errors.classifier import classify_any
+from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION
 from app.db.schema import list_tables
 from app.memory import get_history, save_messages, clear_session
 from app.agent.graph import _filter_new_messages
@@ -161,7 +162,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             engine = build_engine(db_cfg)
             # 上传文件 → DataFrame 字典（供 file_tool 真实查询，磁盘+LRU）
             uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
-            tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files)
+            tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
+                               audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
             graph = make_graph(llm, tools)
 
             ctx = ""
@@ -235,7 +237,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 engine = build_engine(db_cfg)
                 # 上传文件 → DataFrame 字典（供 file_tool 真实查询）
                 uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
-                tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files)
+                tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
+                                   audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
                 graph = make_graph(llm, tools)
 
                 ctx = ""
@@ -328,6 +331,8 @@ async def upload(file: UploadFile = File(...), user: dict = Depends(get_current_
     d2 = df.head(5)
     preview = d2.where(d2.notna(), None).values.tolist()
     save_upload(fid, name, str(file_path), cols, preview, user["uid"])
+    record(A_FILE_UPLOAD, user["uid"], user.get("username"),
+           {"file_id": fid, "name": name, "columns": cols, "rows": len(df)})
     return {"file_id": fid, "columns": cols, "preview_rows": preview}
 
 
@@ -335,6 +340,8 @@ async def upload(file: UploadFile = File(...), user: dict = Depends(get_current_
 def clear_chat(session_id: str, user: dict = Depends(get_current_user)):
     """清除指定会话的对话历史（前端点击「新对话」时可调用）。"""
     clear_session(session_id)
+    record(A_SESSION_ACTION, user["uid"], user.get("username"),
+           {"action": "clear", "session_id": session_id})
     return {"ok": True}
 
 
@@ -367,6 +374,8 @@ def api_delete_session(session_id: str, user: dict = Depends(get_current_user)):
     deleted = db_delete_session(session_id, user["uid"])
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在")
+    record(A_SESSION_ACTION, user["uid"], user.get("username"),
+           {"action": "delete", "session_id": session_id})
     return {"ok": True}
 
 
@@ -384,6 +393,8 @@ def api_rename_session(session_id: str, req: RenameRequest, user: dict = Depends
         raise HTTPException(status_code=400, detail="标题过长（最多 60 字）")
     if not db_rename_session(session_id, title, user["uid"]):
         raise HTTPException(status_code=404, detail="会话不存在")
+    record(A_SESSION_ACTION, user["uid"], user.get("username"),
+           {"action": "rename", "session_id": session_id, "title": title})
     return {"ok": True, "session_id": session_id, "title": title}
 
 

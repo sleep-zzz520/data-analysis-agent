@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
 from app.auth import hash_password, verify_password, create_token, decode_token
+from app.audit import record, A_USER_ACTION
 from app.persistence import (
     create_user, get_user_by_username, claim_orphan_data,
     list_users, update_user_role, update_password, delete_user,
@@ -43,6 +44,7 @@ def register(req: AuthReq):
     if user is None:
         raise HTTPException(400, "用户名已存在")
     claim_orphan_data(user["id"])  # 第一个注册用户自动继承旧版无主数据
+    record(A_USER_ACTION, user["id"], username, {"action": "register", "role": user["role"]})
     return {"ok": True, "token": create_token(user["id"], username, user["role"]), "username": username, "role": user["role"]}
 
 
@@ -52,6 +54,7 @@ def login(req: AuthReq):
     if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(401, "用户名或密码错误")
     claim_orphan_data(user["id"])  # 存量无主会话/上传归给本人，避免升级后历史会话不可见
+    record(A_USER_ACTION, user["id"], user["username"], {"action": "login"})
     return {"ok": True, "token": create_token(user["id"], user["username"], user["role"]), "username": user["username"], "role": user["role"]}
 
 
@@ -83,6 +86,8 @@ def api_set_user_role(user_id: int, req: RoleReq, user: dict = Depends(get_curre
         raise HTTPException(400, "角色只能是 admin 或 user")
     if not update_user_role(user_id, req.role):
         raise HTTPException(404, "用户不存在")
+    record(A_USER_ACTION, user["uid"], user.get("username"),
+           {"action": "set_role", "target_user_id": user_id, "role": req.role})
     return {"ok": True}
 
 
@@ -102,6 +107,7 @@ def api_change_password(req: ChangePwdReq, user: dict = Depends(get_current_user
     if len(req.new_password) < 4:
         raise HTTPException(400, "新密码至少 4 位")
     update_password(user["uid"], hash_password(req.new_password))
+    record(A_USER_ACTION, user["uid"], user.get("username"), {"action": "change_password"})
     return {"ok": True}
 
 
@@ -114,4 +120,5 @@ def api_delete_account(user: dict = Depends(get_current_user)):
             os.remove(p)
         except OSError:
             pass
+    record(A_USER_ACTION, user["uid"], user.get("username"), {"action": "delete_account"})
     return {"ok": True}

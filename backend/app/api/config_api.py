@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from app.meta import store
 from app.meta import crypto
+from app.audit import record, A_CONFIG_CHANGE
 from app.api.auth_api import get_current_user
 
 router = APIRouter(prefix="/api/config", tags=["config"])
@@ -63,13 +64,22 @@ def save_llm(req: LLMConfigSave, user: dict = Depends(get_current_user)):
                 payload["api_key"] = secret["api_key"]
             else:
                 payload.pop("api_key", None)
-    return store.save_llm_config(payload)
+    saved = store.save_llm_config(payload)
+    # 审计只记元信息，绝不落明文 api_key
+    record(A_CONFIG_CHANGE, user["uid"], user.get("username"), {
+        "type": "llm", "action": "update" if req.id else "create",
+        "id": saved.get("id"), "name": saved.get("name"), "provider": saved.get("provider"),
+        "model_name": saved.get("model_name"), "is_default": saved.get("is_default"),
+    })
+    return saved
 
 @router.delete("/llm/{cfg_id}")
 def delete_llm(cfg_id: int, user: dict = Depends(get_current_user)):
     _require_admin(user)
     if not store.delete_llm_config(cfg_id):
         raise HTTPException(404, "LLM config not found")
+    record(A_CONFIG_CHANGE, user["uid"], user.get("username"),
+           {"type": "llm", "action": "delete", "id": cfg_id})
     return {"ok": True}
 
 # ---------- DB ----------
@@ -95,13 +105,21 @@ def save_db(req: DBConfigSave, user: dict = Depends(get_current_user)):
                 payload["password"] = secret["password"]
             else:
                 payload.pop("password", None)
-    return store.save_db_config(payload)
+    saved = store.save_db_config(payload)
+    record(A_CONFIG_CHANGE, user["uid"], user.get("username"), {
+        "type": "db", "action": "update" if req.id else "create",
+        "id": saved.get("id"), "name": saved.get("name"), "host": saved.get("host"),
+        "port": saved.get("port"), "username": saved.get("username"), "is_default": saved.get("is_default"),
+    })
+    return saved
 
 @router.delete("/db/{cfg_id}")
 def delete_db(cfg_id: int, user: dict = Depends(get_current_user)):
     _require_admin(user)
     if not store.delete_db_config(cfg_id):
         raise HTTPException(404, "DB config not found")
+    record(A_CONFIG_CHANGE, user["uid"], user.get("username"),
+           {"type": "db", "action": "delete", "id": cfg_id})
     return {"ok": True}
 
 # ---------- Test Connection ----------

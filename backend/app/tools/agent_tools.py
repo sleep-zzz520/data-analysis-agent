@@ -18,8 +18,19 @@ def _to_md(df):
     body = "\n".join("| " + " | ".join(esc(v) for v in row) + " |" for row in df.values.tolist())
     return "\n".join([head, sep, body])
 
-def make_tools(engine, default_schema=None, files=None):
-    """构造工具集。files: {文件名: DataFrame}，有上传文件时注册文件分析工具。"""
+def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
+    """构造工具集。files: {文件名: DataFrame}，有上传文件时注册文件分析工具。
+
+    audit_ctx: 可选 {"user_id","username","session_id"}，传入后 SQL 执行会写审计日志。
+    """
+    from app.audit import record, A_SQL_QUERY
+    ctx = audit_ctx or {}
+
+    def _audit_sql(sql: str, rows: int, source: str):
+        record(A_SQL_QUERY, ctx.get("user_id"), ctx.get("username"), {
+            "sql": sql, "rows": rows, "source": source, "session_id": ctx.get("session_id"),
+        })
+
     @tool
     def list_schemas() -> str:
         """列出所有业务库名。写 SQL 前必须先调用，判断问题涉及哪些库。"""
@@ -47,6 +58,8 @@ def make_tools(engine, default_schema=None, files=None):
             sql = sql.rstrip(";") + " LIMIT 500"
         try:
             df = pd.read_sql(sql, engine)
+            if ctx:
+                _audit_sql(sql, len(df), "mysql")
             d2 = df.head(200)
             machine = {"columns": list(df.columns),
                        "rows": d2.where(d2.notna(), None).values.tolist()}
@@ -72,6 +85,6 @@ def make_tools(engine, default_schema=None, files=None):
     chart_tools = get_chart_tools()
 
     # 上传文件分析工具（有文件时才注册）
-    file_tools = make_file_tools(files or {})
+    file_tools = make_file_tools(files or {}, audit_ctx=ctx)
 
     return [list_schemas, get_schema, query_mysql, make_chart] + chart_tools + file_tools

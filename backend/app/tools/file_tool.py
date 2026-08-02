@@ -26,13 +26,22 @@ def _to_md(df: pd.DataFrame) -> str:
     return "\n".join([head, sep, body])
 
 
-def make_file_tools(files: Dict[str, pd.DataFrame]) -> List:
+def make_file_tools(files: Dict[str, pd.DataFrame], audit_ctx: Dict | None = None) -> List:
     """根据当前对话的上传文件构造文件分析工具。
 
     files: {文件名: DataFrame}
+    audit_ctx: 可选 {"user_id","username","session_id"}，传入后 SQL 执行会写审计日志。
     """
     if not files:
         return []
+
+    from app.audit import record, A_SQL_QUERY
+    ctx = audit_ctx or {}
+
+    def _audit_query(sql: str, rows: int, file: str):
+        record(A_SQL_QUERY, ctx.get("user_id"), ctx.get("username"), {
+            "sql": sql, "rows": rows, "source": f"file:{file}", "session_id": ctx.get("session_id"),
+        })
 
     @tool
     def list_files() -> str:
@@ -68,6 +77,8 @@ def make_file_tools(files: Dict[str, pd.DataFrame]) -> List:
             con.register("df", df)
             res = con.execute(sql2).fetchdf()
             con.close()
+            if ctx:
+                _audit_query(sql2, len(res), file)
             machine = {
                 "columns": list(res.columns),
                 "rows": res.head(200).where(res.notna(), None).values.tolist(),
