@@ -15,6 +15,15 @@ function sseResponse(frames) {
 describe('streamChat SSE 解析', () => {
   beforeEach(() => { vi.restoreAllMocks() })
 
+  it('请求携带 Authorization token（fetch 不走 axios 拦截器）', async () => {
+    localStorage.setItem('token', 'jwt-test')
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([{ type: 'done', session_id: 's1', reply: 'ok' }]))
+    vi.stubGlobal('fetch', fetchMock)
+    await streamChat({ message: 'hi' })
+    const [, init] = fetchMock.mock.calls[0]
+    expect(init.headers.Authorization).toBe('Bearer jwt-test')
+  })
+
   it('逐帧回调 onDelta 并在 done 时回调 onDone', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
       { type: 'delta', text: '你好' },

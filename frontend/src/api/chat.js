@@ -7,7 +7,11 @@ export async function streamChat(payload, { onDelta, onDone, onError } = {}) {
   try {
     resp = await fetch('/api/chat/stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // fetch 不走 axios 拦截器，需手动带 token（否则后端 401）
+        Authorization: `Bearer ${localStorage.getItem('token') || ''}`
+      },
       body: JSON.stringify(payload)
     })
   } catch (_) {

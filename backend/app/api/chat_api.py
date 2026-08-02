@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, re, json, io, uuid, threading
+import asyncio, re, json, io, uuid, threading, time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, List
@@ -16,6 +16,7 @@ from app.tools.agent_tools import make_tools
 from app.agent.graph import make_graph
 from app.errors.classifier import classify_any
 from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION
+from app.usage import check_budget, record_usage, extract_usage
 from app.db.schema import list_tables
 from app.memory import get_history, save_messages, clear_session
 from app.agent.graph import _filter_new_messages
@@ -77,6 +78,28 @@ def _load_uploaded_dfs(file_ids: List, user_id: int) -> dict:
 # 避免并发请求交错读写内存/SQLite 导致消息错乱（串话、重复）。
 _chat_locks: dict = {}
 _chat_locks_guard: "asyncio.Lock | None" = None
+
+# ── 同请求防重（30s 窗口）：同会话 + 相同消息 + 相同 file_ids 视为重复提交，
+# 直接拒绝不调 LLM（防多 tab/重放导致的历史重复分析与 token 浪费）────────────
+_DEDUP_WINDOW_SECONDS = 30
+_dedup: dict = {}
+_dedup_lock = threading.Lock()
+
+
+def _check_duplicate(sid: str, message: str, file_ids: Optional[list]) -> Optional[str]:
+    """记录本次请求键；30 秒内同会话相同请求返回提示，否则返回 None（放行）。"""
+    key = (sid, (message or "").strip(), tuple(sorted(file_ids or [])))
+    now = time.time()
+    with _dedup_lock:
+        # 顺手清理过期键，防止字典无限增长
+        for k in list(_dedup):
+            if now - _dedup[k] > _DEDUP_WINDOW_SECONDS:
+                del _dedup[k]
+        if key in _dedup:
+            return "检测到重复提交，请等待当前回复完成后稍后再试"
+        _dedup[key] = now
+    return None
+
 
 async def _session_lock(sid: str) -> asyncio.Lock:
     global _chat_locks_guard
@@ -157,6 +180,18 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     lock = await _session_lock(sid)
     async with lock:  # 同一会话串行处理，避免并发交错
         try:
+            # ── 同请求防重：30s 内相同请求拒绝，不调 LLM ──────────────────
+            dup = _check_duplicate(sid, req.message, req.file_ids)
+            if dup:
+                return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid,
+                        "error": {"code": "DUPLICATE_REQUEST", "message": "重复提交",
+                                  "suggestion": dup, "severity": "warn"}}
+            # ── 预算限流：超限直接拒绝，不调 LLM ──────────────────────────
+            ok, reason = check_budget()
+            if not ok:
+                return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid,
+                        "error": {"code": "BUDGET_LIMIT", "message": "模型调用预算已用完",
+                                  "suggestion": reason, "severity": "block"}}
             llm = build_llm(get_llm_secret(req.llm_config_id))
             db_cfg = get_db_secret(req.db_config_id)
             engine = build_engine(db_cfg)
@@ -197,6 +232,14 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             msgs = result_messages
             visuals, tables, sql = _extract(msgs)
             reply = msgs[-1].content if isinstance(msgs[-1], AIMessage) else ""
+
+            # ── token 用量计量（成本估算 + 预算告警）──────────────────────
+            llm_cfg = get_llm_secret(req.llm_config_id)
+            in_t, out_t = extract_usage(result_messages)
+            if in_t or out_t:
+                record_usage(user["uid"], user.get("username"), sid, req.llm_config_id,
+                             llm_cfg.get("provider"), llm_cfg.get("model_name"), in_t, out_t)
+
             # chart/table 字段保留兼容（取最后一个），前端主用 visuals/tables 数组
             return {
                 "reply": reply,
@@ -232,6 +275,22 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     async def gen():
         async with lock:  # 同一会话串行处理，避免并发交错
             try:
+                # ── 同请求防重：30s 内相同请求拒绝，不调 LLM ──────────────
+                dup = _check_duplicate(sid, req.message, req.file_ids)
+                if dup:
+                    yield _sse({"type": "error",
+                                "error": {"code": "DUPLICATE_REQUEST", "message": "重复提交",
+                                          "suggestion": dup, "severity": "warn"},
+                                "session_id": sid})
+                    return
+                # ── 预算限流：超限直接拒绝，不调 LLM ──────────────────────
+                ok, reason = check_budget()
+                if not ok:
+                    yield _sse({"type": "error",
+                                "error": {"code": "BUDGET_LIMIT", "message": "模型调用预算已用完",
+                                          "suggestion": reason, "severity": "block"},
+                                "session_id": sid})
+                    return
                 llm = build_llm(get_llm_secret(req.llm_config_id))
                 db_cfg = get_db_secret(req.db_config_id)
                 engine = build_engine(db_cfg)
@@ -283,6 +342,14 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 # ── 提取图表/SQL，发送最终结果 ────────────────────────────
                 result_messages = list(input_messages) + list(all_new)
                 visuals, tables, sql = _extract(result_messages)
+
+                # ── token 用量计量（成本估算 + 预算告警）──────────────────
+                llm_cfg = get_llm_secret(req.llm_config_id)
+                in_t, out_t = extract_usage(result_messages)
+                if in_t or out_t:
+                    record_usage(user["uid"], user.get("username"), sid, req.llm_config_id,
+                                 llm_cfg.get("provider"), llm_cfg.get("model_name"), in_t, out_t)
+
                 reply = ""
                 for m in reversed(result_messages):
                     if isinstance(m, AIMessage) and m.content:
