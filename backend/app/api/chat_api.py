@@ -242,8 +242,10 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                     m.id = str(uuid.uuid4())  # 稳定 ID，供 SQLite 幂等去重
             save_messages(sid, [user_msg] + new_msgs)
 
-            # ── 持久化：把内存 store 的完整历史同步到 SQLite（幂等去重）────
-            persist_messages(sid, get_history(sid), user["uid"])
+            # ── 持久化：本轮完整消息写入 SQLite（幂等去重）。
+            # 不用 get_history：内存 store 可能被 token 预算裁剪（大工具输出），
+            # 裁剪只影响内存输入，持久化必须保留完整历史 ──
+            persist_messages(sid, [user_msg] + list(new_msgs), user["uid"])
             # ── Agent 轨迹落库：重开会话可回看工具调用链 ────────────────
             save_trace(sid, trace.snapshot(), user["uid"])
 
@@ -377,7 +379,9 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     if not getattr(m, "id", None):
                         m.id = str(uuid.uuid4())
                 save_messages(sid, [user_msg] + list(all_new))
-                persist_messages(sid, get_history(sid), user["uid"])
+                # ── 持久化：本轮完整消息写入 SQLite（幂等去重），
+                # 不依赖内存 store（可能被 token 预算裁剪）──
+                persist_messages(sid, [user_msg] + list(all_new), user["uid"])
                 # ── Agent 轨迹落库：重开会话可回看工具调用链 ────────────
                 save_trace(sid, trace.snapshot(), user["uid"])
 

@@ -20,6 +20,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
@@ -33,6 +35,10 @@ SQL_TOOL_NAMES = ("list_schemas", "get_schema", "query_mysql")
 VIZ_TOOL_NAMES = ("make_chart", "generate_chart", "auto_analyze_and_visualize")
 FILE_TOOL_NAMES = ("list_files", "query_file", "file_stats")
 
+# 专家子图内可能生成的前端标记（图表/表格/图片）：必须原样带回主管层，
+# 否则标记只留在专家子图内部，_extract 提取不到 → 前端无图/无表。
+_MARK_RE = re.compile(r"<!--(?:CHART|TABLE|IMAGE_BASE64):.*?-->", re.S)
+
 
 def _make_expert_tool(name: str, description: str, llm, tools: list, system_prompt: str,
                       trace=None):
@@ -45,8 +51,20 @@ def _make_expert_tool(name: str, description: str, llm, tools: list, system_prom
         """(description 由外层注入)"""
         msgs = [SystemMessage(content=system_prompt), HumanMessage(content=request)]
         result = subgraph.invoke({"messages": msgs})
-        last = result["messages"][-1]
-        return str(getattr(last, "content", None) or "")
+        sub_msgs = result["messages"]
+        last = sub_msgs[-1]
+        reply = str(getattr(last, "content", None) or "")
+        # 把子图内生成的图表/表格/图片标记全部带回（去重保序），
+        # 供主管层 _extract 提取、前端渲染。
+        marks: list = []
+        for m in sub_msgs:
+            c = str(getattr(m, "content", None) or "")
+            for mk in _MARK_RE.findall(c):
+                if mk not in marks:
+                    marks.append(mk)
+        if marks:
+            reply = (reply.rstrip() + "\n" + "\n".join(marks)).strip()
+        return reply
 
     expert.name = name
     return expert

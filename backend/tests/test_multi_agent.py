@@ -116,3 +116,21 @@ def test_fallback_when_no_tools():
     assert prompt == SUPERVISOR_PROMPT  # prompt 仍返回（调用方统一使用）
     result = graph.invoke({"messages": [HumanMessage(content="hi")]})
     assert result["messages"][-1].content == "hi"
+
+
+# ── 图表标记回传（前端渲染的关键）────────────────────────────────────────────
+def test_viz_expert_forwards_chart_markup():
+    """专家最终回复没带 CHART 标记时，标记也必须从子图 ToolMessage 带回主管层。"""
+    llm = FakeLLM(responses=[
+        _tool_call("viz_expert", {"request": "画柱状图"}, "c1"),          # 主管 → 专家
+        _tool_call("make_chart", {"chart_type": "bar", "title": "对比",
+                                  "x_labels": ["A"], "series": [{"name": "s", "data": [1]}]}, "c2"),  # 专家 → 图表工具
+        AIMessage(content="已生成柱状图"),                                   # 专家回复（无标记）
+        AIMessage(content="已为您生成柱状图。"),                             # 主管最终回复
+    ])
+    graph, _ = make_agent(llm, _all_tools())
+    result = graph.invoke({"messages": [HumanMessage(content="画个图")]})
+    # 主管图里应存在含 CHART 标记的 ToolMessage（viz_expert 返回值）
+    chart_found = any("<!--CHART:" in (m.content or "") for m in result["messages"])
+    assert chart_found, "专家子图的 CHART 标记必须回传到主管层，否则前端无图"
+    assert result["messages"][-1].content == "已为您生成柱状图。"

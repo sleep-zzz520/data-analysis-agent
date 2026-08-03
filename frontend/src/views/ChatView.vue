@@ -328,6 +328,13 @@ async function loadSession(sid, silent = false) {
     scroll()
   } catch (err) {
     if (mySeq !== loadSeq) return
+    // 会话后端还不存在（发送中跳走又回来）：展示本地 pending 消息，避免"会话消失"
+    const pending = pendingMsgs.value.get(sid) || []
+    if (pending.length) {
+      messages.value = [...pending]
+      scroll()
+      return
+    }
     if (!silent) messages.value.push({ role: 'assistant', error: err, timestamp: new Date().toISOString() })
   }
 }
@@ -438,8 +445,11 @@ async function send() {
           target.trace = (target.trace || []).concat(entries)
         },
         onDone: (res) => {
-          if (store.sessionId !== sidAtSend) return  // 发送期间切换了会话：不显示，消息已落库
-          if (res.session_id) store.setSession(res.session_id)
+          // 发送期间跳走了（如去配置中心）：也把会话 id 固化到 store，
+          // 回来时按真实 id 加载（此时后端已完成 persist）；用户已切到其他
+          // 会话则不覆盖（store.sessionId 已变）
+          if (res.session_id && store.sessionId === sidAtSend) store.setSession(res.session_id)
+          if (store.sessionId !== sidAtSend) return  // 已切换会话：不显示，消息已落库
           const msg = messages.value.find(m => m._key === assistantMsg._key)
           if (!msg) return
           msg.trace = res.trace || msg.trace || []
