@@ -137,6 +137,18 @@
 
                 <!-- AI 回复：Markdown 渲染为美观格式 -->
                 <MarkdownContent v-if="m.role === 'assistant' && m.text" :content="m.text" />
+                <details v-if="m.role === 'assistant' && m.plan" class="analysis-plan">
+                  <summary>分析计划</summary>
+                  <div class="plan-goal">{{ m.plan.goal }}</div>
+                  <div v-for="step in (m.plan.steps || [])" :key="step.id" class="plan-step">
+                    <span :class="'plan-status-' + step.status">{{ step.status === 'succeeded' ? '✓' : step.status === 'failed' ? '!' : step.status === 'running' ? '⟳' : '○' }}</span>{{ step.title }}
+                  </div>
+                  <div v-if="(m.plan.quality_issues || []).length" class="plan-warning">{{ m.plan.quality_issues.join('；') }}</div>
+                  <div v-if="m.plan.clarification_needed" class="plan-warning">{{ m.plan.clarification_question }}</div>
+                  <div v-for="ev in (m.plan.evidence || [])" :key="ev.created_at + ev.source" class="plan-evidence">
+                    证据：{{ ev.source }}，{{ ev.row_count }} 行{{ ev.quality_issues?.length ? '，存在质量问题' : '' }}
+                  </div>
+                </details>
                     
                 <!-- AI回复的SQL/表格/图表/错误 -->
                 <template v-if="m.role === 'assistant'">
@@ -444,6 +456,11 @@ async function send() {
           if (!target) return
           target.trace = (target.trace || []).concat(entries)
         },
+        onPlan: (plan) => {
+          if (store.sessionId !== sidAtSend) return
+          const target = messages.value.find(m => m._key === assistantMsg._key)
+          if (target) target.plan = plan
+        },
         onDone: (res) => {
           // 发送期间跳走了（如去配置中心）：也把会话 id 固化到 store，
           // 回来时按真实 id 加载（此时后端已完成 persist）；用户已切到其他
@@ -452,6 +469,7 @@ async function send() {
           if (store.sessionId !== sidAtSend) return  // 已切换会话：不显示，消息已落库
           const msg = messages.value.find(m => m._key === assistantMsg._key)
           if (!msg) return
+          msg.plan = res.plan || msg.plan || null
           msg.trace = res.trace || msg.trace || []
           msg.sql = res.sql || null
           // 一轮可能有多张图表/表格（visuals/tables 数组），兼容旧字段
@@ -863,6 +881,23 @@ function autoResize() {
 .msg-wrapper.assistant .msg .msg-bubble.assistant:hover {
   background: #F5F6F8;
 }
+
+.analysis-plan {
+  margin: 10px 0 4px;
+  border: 1px solid #E5E6EB;
+  border-radius: 9px;
+  background: #fff;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+.analysis-plan summary { cursor: pointer; font-weight: 600; color: var(--text-secondary); }
+.plan-goal { margin: 8px 0; color: var(--text-primary); }
+.plan-step { display: flex; gap: 6px; align-items: center; margin: 4px 0; color: var(--text-secondary); }
+.plan-status-succeeded { color: #16A34A; }
+.plan-status-running { color: #D97706; }
+.plan-status-failed { color: #DC2626; }
+.plan-warning { margin-top: 7px; color: #B45309; }
+.plan-evidence { margin-top: 5px; color: var(--text-tertiary); }
 
 /* ── Text Content ── */
 .text {

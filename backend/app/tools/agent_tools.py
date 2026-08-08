@@ -1,7 +1,7 @@
 import json, re
 import pandas as pd
 from langchain_core.tools import tool
-from app.db.schema import list_business_schemas, get_schema_text
+from app.db.schema import list_business_schemas, get_schema_text, get_table_schema_text
 from app.tools.chart_tool import get_chart_tools
 from app.tools.file_tool import make_file_tools
 
@@ -55,6 +55,13 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
         return get_schema_text(engine, schema)
 
     @tool
+    def get_table_schema(schema: str, tables: list[str]) -> str:
+        """只查看指定表的字段结构；已有分析计划时优先使用，避免加载整个库。"""
+        if not schema or not tables:
+            return "错误：schema 和 tables 都不能为空。"
+        return get_table_schema_text(engine, schema, tables)
+
+    @tool
     def query_mysql(sql: str) -> str:
         """执行只读 SELECT。横杠库名必须反引号全限定，如 `share-order`.`表名`。报错时据错误信息修正后重试。"""
         if _FORBIDDEN.search(sql):
@@ -97,4 +104,4 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
     # 上传文件分析工具（有文件时才注册）
     file_tools = make_file_tools(files or {}, audit_ctx=ctx)
 
-    return [list_schemas, get_schema, query_mysql, make_chart] + chart_tools + file_tools
+    return [list_schemas, get_schema, get_table_schema, query_mysql, make_chart] + chart_tools + file_tools

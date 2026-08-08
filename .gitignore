@@ -5,6 +5,8 @@ backend/.env
 # backend/data/ 含加密配置、密钥、SQLite、上传文件
 backend/data/
 
+docs/
+
 # 密钥文件
 *.master_key
 

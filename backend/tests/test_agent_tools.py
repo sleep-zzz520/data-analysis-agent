@@ -91,7 +91,7 @@ def test_make_chart_bar():
 
 def test_make_tools_registers_core_tools():
     names = [t.name for t in make_tools(engine=None)]
-    assert names[:4] == ["list_schemas", "get_schema", "query_mysql", "make_chart"]
+    assert names[:5] == ["list_schemas", "get_schema", "get_table_schema", "query_mysql", "make_chart"]
 
 
 # ── 长工具输出压缩 ────────────────────────────────────────────────────────────
@@ -111,4 +111,3 @@ def test_query_mysql_short_output_not_omitted(monkeypatch):
     out = tools["query_mysql"].invoke({"sql": "SELECT * FROM t"})
     assert "已省略" not in out
     assert "| 9 |" in out
-

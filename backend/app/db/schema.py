@@ -26,6 +26,36 @@ def list_tables(engine, schema=None, prefix: str = "share-") -> list:
                 out.append({"name": f"{s}.{tname}", "comment": tcom or ""})
     return out
 
+def get_table_schema_text(engine, schema: str, tables: list[str]) -> str:
+    """只加载指定表的字段，供分析计划按需补充 Schema。"""
+    if not schema or not tables:
+        return "(未指定表)"
+    wanted = list(dict.fromkeys(tables))
+    placeholders = ", ".join(f":t{i}" for i in range(len(wanted)))
+    params = {"s": schema, **{f"t{i}": table for i, table in enumerate(wanted)}}
+    with engine.connect() as c:
+        rows = c.execute(text(
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT, COLUMN_KEY "
+            f"FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=:s AND TABLE_NAME IN ({placeholders}) "
+            "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+        ), params).fetchall()
+        table_comments = c.execute(text(
+            "SELECT TABLE_NAME, TABLE_COMMENT FROM INFORMATION_SCHEMA.TABLES "
+            f"WHERE TABLE_SCHEMA=:s AND TABLE_TYPE='BASE TABLE' AND TABLE_NAME IN ({placeholders})"
+        ), params).fetchall()
+    comments = {name: comment or "" for name, comment in table_comments}
+    lines = []
+    for table in wanted:
+        if table not in comments and not any(row[0] == table for row in rows):
+            continue
+        lines.append(f"- 表 {_q(schema)}.{_q(table)}" + (f"  -- {comments.get(table)}" if comments.get(table) else ""))
+        for tname, cname, ctype, ccom, ckey in rows:
+            if tname != table:
+                continue
+            tag = " [PK]" if ckey == "PRI" else (" [IDX]" if ckey else "")
+            lines.append(f"    * {cname} {ctype}{tag}" + (f"  -- {ccom}" if ccom else ""))
+    return "\n".join(lines) or "(未找到指定表)"
+
 def get_schema_text(engine, schema=None, prefix: str = "share-") -> str:
     targets = [schema] if schema else list_business_schemas(engine, prefix)
     return "\n\n".join(_render_one(engine, s) for s in targets) or "(无业务库)"

@@ -66,7 +66,7 @@ SUPERVISOR_PROMPT = """你是数据分析团队的主管（Supervisor），管�
 
 SQL_EXPERT_PROMPT = """你是 SQL 查询专家，只负责 MySQL 多库数据分析。
 
-【流程】list_schemas 看有哪些业务库 → get_schema(相关库) 看表结构（不要一次看全部）→ query_mysql 执行只读 SELECT。
+【流程】list_schemas 看有哪些业务库 → 优先用 get_table_schema 查看计划涉及的表（必要时才用 get_schema）→ query_mysql 执行只读 SELECT。
 【规则】
 - 库名/表名一律反引号全限定（如 `share-order`.`order_main`）；跨库用全限定 join
 - 只读：只写 SELECT；SQL 报错根据错误信息修正后重试，最多 3 次

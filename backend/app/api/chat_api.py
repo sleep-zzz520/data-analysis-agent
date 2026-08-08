@@ -21,6 +21,7 @@ from app.memory.agent_memory import (
     build_memory_context, extract_and_store_memories, summary_due, generate_summary,
 )
 from app.db.schema import list_tables
+from app.agent.analysis_plan import make_analysis_plan_graph, PlanRuntime, plan_context
 from app.memory import get_history, save_messages, clear_session
 from app.memory.store import budget_history, estimate_tokens, MAX_TOKENS
 from app.agent.graph import _filter_new_messages
@@ -136,6 +137,32 @@ _CHART_RE = re.compile(r"<!--CHART:(.*?)-->", re.S)
 _TABLE_RE = re.compile(r"<!--TABLE:(.*?)-->", re.S)
 _IMAGE_RE = re.compile(r"<!--IMAGE_BASE64:(.*?)-->", re.S)
 
+def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: list, user_id: int):
+    """规划失败只降级，不阻断原有 Agent；返回计划和 SSE 事件。"""
+    try:
+        catalog = list_tables(engine, schema)
+        for fid in file_ids:
+            meta = get_upload(str(fid), user_id)
+            if meta:
+                catalog.append({"name": meta["name"], "comment": "上传文件", "columns": meta.get("columns", [])})
+    except Exception:
+        catalog = []
+    result = make_analysis_plan_graph(llm).invoke({
+        "question": question, "catalog": catalog, "plan": None, "error": None,
+    })
+    plan = result["plan"]
+    return plan, {"type": "plan", "event": "plan_created", "plan": plan.model_dump(exclude_none=True)}
+
+
+def _guard_reply(reply: str, plan) -> str:
+    """质量校验未通过时，把限制明确呈现给用户，避免模型只给确定性结论。"""
+    warnings = list(dict.fromkeys(plan.quality_issues))
+    if warnings:
+        return (reply or "") + "\n\n> 结果质量提示：" + "；".join(warnings) + "。以上结论仅供参考，请补充数据或调整口径后重试。"
+    if plan.metrics and not plan.evidence:
+        return (reply or "") + "\n\n> 证据提示：本轮没有获得可验证的查询结果，无法确认定量结论。"
+    return reply
+
 def _extract(messages):
     """从工具结果中提取本轮所有图表/表格/SQL（支持一轮多个，不再覆盖）。"""
     visuals: List[dict] = []   # [{chart, image}]
@@ -206,22 +233,23 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
-            trace = TraceCollector()
-            graph, supervisor_prompt = make_agent(llm, tools, trace=trace)
-
             ctx = ""
             for fid in req.file_ids:
                 meta = get_upload(str(fid), user["uid"])
                 if meta:
                     ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
             user_text = (ctx + "\n" + req.message) if ctx else req.message
+            plan, _plan_event = _build_plan(llm, engine, req.message, db_cfg.get("default_schema"), req.file_ids, user["uid"])
+            runtime = PlanRuntime(plan, req.message)
+            trace = TraceCollector()
+            graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime)
 
             # ── 多轮对话：先从 SQLite 懒加载（服务重启后自动恢复）───────────────
             _ensure_loaded(sid, user["uid"])
             history = get_history(sid)
             # ── 上下文压缩：token 预算制截断（替代纯轮数截断），
             # 历史 + 当前消息总估算 token 不超过预算，防止上下文无限膨胀 ──
-            system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT
+            system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT + "\n\n" + plan_context(plan)
             # ── 记忆注入：长期记忆（跨会话）+ 会话摘要 + 相关历史检索 ──────
             memory_ctx = build_memory_context(user["uid"], sid, req.message)
             if memory_ctx:
@@ -231,8 +259,15 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 SystemMessage(content=system_prompt)
             ] + history + [HumanMessage(content=user_text)]
 
+            if plan.clarification_needed:
+                reply = plan.clarification_question or "当前指标口径不明确，请补充确认后再执行。"
+                return {"reply": reply, "visuals": [], "tables": [], "chart": None, "table": None,
+                        "sql": None, "session_id": sid, "plan": plan.model_dump(exclude_none=True),
+                        "evidence": [], "trace": []}
+
             result = await asyncio.to_thread(graph.invoke, {"messages": input_messages})
             result_messages = result["messages"]
+            runtime.finalize()
 
             # 提取本轮新增消息并保存到内存记忆（包括用户输入和 Agent 回复）
             new_msgs = _filter_new_messages(input_messages, result_messages)
@@ -252,6 +287,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             msgs = result_messages
             visuals, tables, sql = _extract(msgs)
             reply = msgs[-1].content if isinstance(msgs[-1], AIMessage) else ""
+            reply = _guard_reply(reply, plan)
 
             # ── token 用量计量（成本估算 + 预算告警）──────────────────────
             llm_cfg = get_llm_secret(req.llm_config_id)
@@ -275,6 +311,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 "table": tables[-1] if tables else None,
                 "sql": sql,
                 "session_id": sid,
+                "plan": plan.model_dump(exclude_none=True),
+                "evidence": plan.evidence,
                 "trace": trace.snapshot(),
             }
         except Exception as e:
@@ -326,20 +364,29 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                    audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
-                trace = TraceCollector()
-                graph, supervisor_prompt = make_agent(llm, tools, trace=trace)
-
                 ctx = ""
                 for fid in req.file_ids:
                     meta = get_upload(str(fid), user["uid"])
                     if meta:
                         ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
                 user_text = (ctx + "\n" + req.message) if ctx else req.message
+                plan, plan_event = _build_plan(llm, engine, req.message, db_cfg.get("default_schema"), req.file_ids, user["uid"])
+                yield _sse(plan_event)
+                plan_updates = []
+                runtime = PlanRuntime(plan, req.message, on_update=lambda snapshot: plan_updates.append(snapshot))
+                trace = TraceCollector()
+                graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime)
+
+                if plan.clarification_needed:
+                    yield _sse({"type": "done", "reply": plan.clarification_question or "当前指标口径不明确，请补充确认后再执行。",
+                                "visuals": [], "tables": [], "chart": None, "table": None, "sql": None,
+                                "session_id": sid, "plan": plan.model_dump(exclude_none=True), "evidence": [], "trace": []})
+                    return
 
                 _ensure_loaded(sid, user["uid"])
                 history = get_history(sid)
                 # ── 上下文压缩：token 预算制截断（与同步接口一致）─────────
-                system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT
+                system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT + "\n\n" + plan_context(plan)
                 # ── 记忆注入：长期记忆 + 会话摘要 + 相关历史检索（与同步一致）─
                 memory_ctx = build_memory_context(user["uid"], sid, req.message)
                 if memory_ctx:
@@ -354,6 +401,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 #  - "updates" ：每步完整消息 → 本地收集，用于保存/提取图表
                 all_new: List = []
                 trace_sent: int = 0
+                plan_sent: int = 0
                 async for mode, data in graph.astream(
                     {"messages": input_messages},
                     stream_mode=["messages", "updates"],
@@ -372,6 +420,10 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                         if len(entries) > trace_sent:
                             yield _sse({"type": "trace", "entries": entries[trace_sent:]})
                             trace_sent = len(entries)
+                        if len(plan_updates) > plan_sent:
+                            for snapshot in plan_updates[plan_sent:]:
+                                yield _sse({"type": "plan", "event": "step_updated", "plan": snapshot})
+                            plan_sent = len(plan_updates)
 
                 # ── 保存（内存 + SQLite），与同步接口一致 ────────────────
                 user_msg = HumanMessage(content=user_text, id=str(uuid.uuid4()))
@@ -387,6 +439,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 
                 # ── 提取图表/SQL，发送最终结果 ────────────────────────────
                 result_messages = list(input_messages) + list(all_new)
+                runtime.finalize()
                 visuals, tables, sql = _extract(result_messages)
 
                 # ── token 用量计量（成本估算 + 预算告警）──────────────────
@@ -401,6 +454,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     if isinstance(m, AIMessage) and m.content:
                         reply = m.content
                         break
+                reply = _guard_reply(reply, plan)
 
                 # ── 记忆沉淀：节流提取长期事实 + 节流更新会话摘要 ──────────
                 extract_and_store_memories(llm, user["uid"], user.get("username"), sid,
@@ -417,6 +471,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     "table": tables[-1] if tables else None,
                     "sql": sql,
                     "session_id": sid,
+                    "plan": plan.model_dump(exclude_none=True),
+                    "evidence": plan.evidence,
                     "trace": trace.snapshot(),
                 })
             except Exception as e:

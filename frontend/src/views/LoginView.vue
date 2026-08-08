@@ -9,6 +9,9 @@
       <p v-if="isRegister" class="login-tip">
         新注册账号为<b>普通用户</b>；系统<b>首个注册</b>的账号自动成为<b>管理员</b>（可管理全局配置与用户）。
       </p>
+      <p v-if="!isRegister && showTestCredentials" class="login-tip test-credentials">
+        测试管理员：<b>admin</b> / <b>admin1234</b>
+      </p>
       <form @submit.prevent="submit">
         <div class="field">
           <label>用户名</label>
@@ -42,6 +45,7 @@ const username = ref('')
 const password = ref('')
 const error = ref('')
 const loading = ref(false)
+const showTestCredentials = import.meta.env.DEV
 
 async function submit() {
   if (username.value.trim().length < 2 || password.value.length < 4) {

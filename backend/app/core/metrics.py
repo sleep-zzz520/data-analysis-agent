@@ -66,7 +66,7 @@ class Metrics:
 
     # ── internal ────────────────────────────────────────────────────────────
     def _expire_window(self, now: float) -> None:
-        while self._window and now - self._window[0][0] > self._window_seconds:
+        while self._window and now - self._window[0][0] >= self._window_seconds:
             self._window.popleft()
 
     @staticmethod

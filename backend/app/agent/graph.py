@@ -35,7 +35,8 @@ def _filter_new_messages(input_messages: list, result_messages: list) -> list:
 
 
 def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
-               trace: "TraceCollector | None" = None, agent_name: str = "agent"):
+               trace: "TraceCollector | None" = None, agent_name: str = "agent",
+               plan_runtime=None):
     """构造显式编排的 Agent 图。签名与 create_react_agent 用法兼容（chat_api 无需改动）。
 
     trace：可选轨迹采集器（多智能体模式下主管/专家共享同一个，
@@ -66,6 +67,8 @@ def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
         for tc in tool_calls:
             fn = tool_map.get(tc.get("name"))
             entry = None
+            if plan_runtime is not None:
+                plan_runtime.before_tool(tc.get("name") or "?", tc.get("args") or {})
             if trace is not None:
                 entry = trace.begin(agent_name, tc.get("name") or "?",
                                     tc.get("args") or {})
@@ -78,12 +81,18 @@ def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
                 continue
             try:
                 result = fn.invoke(tc.get("args") or {})
-                outs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                result_text = str(result)
+                issues = plan_runtime.after_tool(tc.get("name") or "?", tc.get("args") or {}, result_text) if plan_runtime else []
+                if issues:
+                    result_text += "\n【结果质量校验】" + "；".join(issues) + "。请勿生成确定性结论。"
+                outs.append(ToolMessage(content=result_text, tool_call_id=tc.get("id", ""), name=tc.get("name")))
                 if entry is not None:
                     trace.end(entry, result, status="ok")
             except Exception as e:  # noqa: BLE001 —— 工具异常统一转 ToolMessage，交给 LLM 反思
                 outs.append(ToolMessage(
                     content=f"工具执行异常：{e}", tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                if plan_runtime is not None:
+                    plan_runtime.after_tool(tc.get("name") or "?", tc.get("args") or {}, f"工具执行异常：{e}")
                 if entry is not None:
                     trace.end(entry, f"工具执行异常：{e}", status="error")
 
